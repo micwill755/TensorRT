@@ -748,6 +748,7 @@ def _forward_tiled_aspect_ratio_vision(
     output = vision.transformer(
         hidden_state,
         attention_mask=compact_attention_mask,
+        output_hidden_states=True,
     )
     hidden_state = output.last_hidden_state
     hidden_state = vision.layernorm_post(hidden_state)

@@ -9,6 +9,7 @@ attention plugins with ViT models. Unlike LLMs, ViT models:
 """
 
 import ctypes
+import inspect
 import os
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -103,8 +104,7 @@ def set_vit_plugin_config_from_model(model_config: Any) -> None:
         model_config: HuggingFace model configuration object.
     """
     # HuggingFace vision configs use slightly different field names across
-    # families. Plain ViT uses num_attention_heads; Mllama/Llama Vision uses
-    # attention_heads.
+    # families.
     num_heads = getattr(model_config, "num_attention_heads", None) or getattr(
         model_config, "attention_heads"
     )
@@ -234,8 +234,8 @@ class ViTPluginAttention(nn.Module):
     module layout from the original module instead of requiring a separate hand
     written implementation for every model family. It supports common vision
     attention layouts:
-    - fused QKV projection: qkv + proj (Qwen-VL style)
-    - separate Q/K/V: q_proj/k_proj/v_proj + o_proj (Mllama/Llama Vision style)
+    - fused QKV projection: qkv + proj
+    - separate Q/K/V: q_proj/k_proj/v_proj + o_proj
     - HuggingFace ViT: query/key/value + output.dense
 
     RoPE is also inferred from the forward inputs. Models that pass
@@ -566,6 +566,8 @@ class ViTPluginAttention(nn.Module):
 # -----------------------------------------------------------------------------
 
 VIT_INPUT_CONTRACT_NATIVE = "native"
+VIT_INPUT_CONTRACT_GRID_THW = "grid_thw"
+VIT_INPUT_CONTRACT_STATIC_GRID_THW = "static_grid_thw"
 VIT_INPUT_CONTRACT_WINDOWED_ROPE = "windowed_rope"
 VIT_INPUT_CONTRACT_TILED_ASPECT_RATIO = "tiled_aspect_ratio"
 
@@ -573,6 +575,65 @@ def _require_tensor(value: Optional[torch.Tensor], name: str) -> torch.Tensor:
     if value is None:
         raise ValueError(f"ViT plugin forward requires {name}.")
     return value
+
+
+def _supports_static_grid_thw_internal_forward(model: nn.Module) -> bool:
+    return all(
+        hasattr(model, attr_name)
+        for attr_name in (
+            "patch_embed",
+            "fast_pos_embed_interpolate",
+            "rot_pos_emb",
+            "blocks",
+        )
+    )
+
+
+def _make_static_grid_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
+    grid_thw_list = grid_thw.detach().cpu().tolist()
+    cu_seqlens = [0]
+    total = 0
+    for num_frames, height, width in grid_thw_list:
+        for _ in range(int(num_frames)):
+            total += int(height) * int(width)
+            cu_seqlens.append(total)
+    return torch.tensor(cu_seqlens, dtype=torch.int32, device=grid_thw.device)
+
+
+def _forward_static_grid_thw_vision(
+    model: nn.Module,
+    pixel_values: torch.Tensor,
+    pos_embeds: Optional[torch.Tensor],
+    rotary_pos_emb: Optional[torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor],
+) -> torch.Tensor:
+    pos_embeds = _require_tensor(pos_embeds, "static_grid_pos_embeds")
+    rotary_pos_emb = _require_tensor(rotary_pos_emb, "static_grid_rotary_pos_emb")
+    cu_seqlens = _require_tensor(cu_seqlens, "static_grid_cu_seqlens")
+
+    hidden_states = model.patch_embed(pixel_values)
+    hidden_states = hidden_states + pos_embeds.to(
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+
+    seq_len, _ = hidden_states.size()
+    hidden_states = hidden_states.reshape(seq_len, -1)
+    rotary_pos_emb = rotary_pos_emb.to(
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    ).reshape(seq_len, -1)
+    emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+    position_embeddings = (emb.cos(), emb.sin())
+    cu_seqlens = cu_seqlens.to(device=hidden_states.device)
+
+    for block in model.blocks:
+        hidden_states = block(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
+        )
+    return hidden_states
 
 
 def _get_windowed_rope_visual_model(model: nn.Module) -> nn.Module:
@@ -745,11 +806,12 @@ def _forward_tiled_aspect_ratio_vision(
     slice_index = -num_padding_patches if num_padding_patches > 0 else None
 
     hidden_state = hidden_state.view(batch_size * num_concurrent_media, -1, dim)
-    output = vision.transformer(
-        hidden_state,
-        attention_mask=compact_attention_mask,
-        output_hidden_states=True,
-    )
+    transformer_kwargs = {"attention_mask": compact_attention_mask}
+    if "output_hidden_states" in inspect.signature(
+        vision.transformer.forward
+    ).parameters:
+        transformer_kwargs["output_hidden_states"] = True
+    output = vision.transformer(hidden_state, **transformer_kwargs)
     hidden_state = output.last_hidden_state
     hidden_state = vision.layernorm_post(hidden_state)
 
@@ -819,7 +881,7 @@ def _forward_native_vision(
     pixel_values: torch.Tensor,
     **kwargs,
 ) -> torch.Tensor:
-    output = model(pixel_values)
+    output = model(pixel_values, **kwargs)
     if hasattr(output, "last_hidden_state"):
         return output.last_hidden_state
     if isinstance(output, (tuple, list)):
@@ -841,11 +903,35 @@ class ViTPluginWrapper(nn.Module):
         model: nn.Module,
         input_contract: str = VIT_INPUT_CONTRACT_NATIVE,
         max_window_seq_len: int = 0,
+        static_grid_thw: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.model = model
         self.input_contract = input_contract
         self.max_window_seq_len = max_window_seq_len
+        self.uses_static_grid_internal_forward = False
+        if static_grid_thw is not None:
+            static_grid_thw = static_grid_thw.clone()
+            if _supports_static_grid_thw_internal_forward(model):
+                with torch.no_grad():
+                    self.register_buffer(
+                        "static_grid_pos_embeds",
+                        model.fast_pos_embed_interpolate(static_grid_thw).detach(),
+                    )
+                    self.register_buffer(
+                        "static_grid_rotary_pos_emb",
+                        model.rot_pos_emb(static_grid_thw).detach(),
+                    )
+                    self.register_buffer(
+                        "static_grid_cu_seqlens",
+                        _make_static_grid_cu_seqlens(static_grid_thw),
+                    )
+                self.uses_static_grid_internal_forward = True
+                self.static_grid_thw = None
+            else:
+                self.register_buffer("static_grid_thw", static_grid_thw)
+        else:
+            self.static_grid_thw = None
 
     def forward(
         self,
@@ -857,6 +943,7 @@ class ViTPluginWrapper(nn.Module):
         window_index: Optional[torch.Tensor] = None,
         reverse_window_index: Optional[torch.Tensor] = None,
         aspect_ratio_ids: Optional[torch.Tensor] = None,
+        grid_thw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.input_contract == VIT_INPUT_CONTRACT_WINDOWED_ROPE:
             return _forward_windowed_rope_vision(
@@ -876,6 +963,26 @@ class ViTPluginWrapper(nn.Module):
                 pixel_values,
                 aspect_ratio_ids=aspect_ratio_ids,
                 attention_mask=attention_mask,
+            )
+        if self.input_contract == VIT_INPUT_CONTRACT_GRID_THW:
+            return _forward_native_vision(
+                self.model,
+                pixel_values,
+                grid_thw=_require_tensor(grid_thw, "grid_thw"),
+            )
+        if self.input_contract == VIT_INPUT_CONTRACT_STATIC_GRID_THW:
+            if self.uses_static_grid_internal_forward:
+                return _forward_static_grid_thw_vision(
+                    self.model,
+                    pixel_values,
+                    self.static_grid_pos_embeds,
+                    self.static_grid_rotary_pos_emb,
+                    self.static_grid_cu_seqlens,
+                )
+            return _forward_native_vision(
+                self.model,
+                pixel_values,
+                grid_thw=_require_tensor(self.static_grid_thw, "static_grid_thw"),
             )
         if self.input_contract == VIT_INPUT_CONTRACT_NATIVE:
             return _forward_native_vision(self.model, pixel_values)
@@ -897,8 +1004,8 @@ def replace_vit_attention_with_plugin(
 
     This is the vision-side equivalent of the LLM helper: callers use one
     replacement entry point, and the function detects the model structure:
-    - Qwen-VL visual blocks: ``blocks[*].attn``
-    - Mllama/Llama Vision stacks: ``transformer/global_transformer.layers[*].self_attn``
+    - block-based vision stacks: ``blocks[*].attn``
+    - transformer/global-transformer stacks: ``*.layers[*].self_attn``
     - HF ViT-style encoders: ``encoder.layer[*].attention.self``
 
     Args:
@@ -910,7 +1017,7 @@ def replace_vit_attention_with_plugin(
     """
     replacement_count = 0
 
-    # Qwen2.5-VL visual tower: model.visual.blocks or visual.blocks.
+    # Block-based visual tower: model.visual.blocks or visual.blocks.
     visual_model = model.visual if hasattr(model, "visual") else model
     if hasattr(visual_model, "blocks"):
         for i, block in enumerate(visual_model.blocks):
@@ -922,9 +1029,8 @@ def replace_vit_attention_with_plugin(
         if replacement_count:
             return model
 
-    # Mllama is HuggingFace's architecture name for official Meta Llama 3.2
-    # Vision models. Its self_attn returns (hidden_state, attn_weights), so
-    # self_attn replacements ask the generic plugin wrapper to return a tuple.
+    # Some self-attention modules return (hidden_state, attn_weights), so
+    # these replacements ask the generic plugin wrapper to return a tuple.
     vision_model = model.vision_model if hasattr(model, "vision_model") else model
     layer_idx = 0
     for encoder_name in ("transformer", "global_transformer"):

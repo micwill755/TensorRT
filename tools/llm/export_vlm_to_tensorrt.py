@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""Standalone VLM export scaffold for Torch-TensorRT experiments.
+"""Compile path for VLM vision towers.
 
-This script intentionally does not import run_vlm.py. It is meant as a small
-x86-first artifact path for the next project direction:
+This script takes a Hugging Face/PyTorch model vision tower through:
 
-    Hugging Face VLM -> torch.export -> optional ExecuTorch .pte
-    -> optional Torch-TensorRT saved artifact -> raw TensorRT engine
+    HF/PyTorch model -> torch.export -> Torch-TensorRT compile
+    -> serialized TensorRT engine
 
-The first target is the vision tower because it has a compact tensor contract.
+The exported artifact is focused on the vision tower because it has a compact
+tensor contract that can be validated independently from text generation.
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import ctypes
+import importlib
+import inspect
 import json
 import re
 from pathlib import Path
@@ -22,10 +25,12 @@ from typing import Any, Dict, List, Tuple
 import torch
 from PIL import Image
 from torch import nn
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from plugin_utils_vit import (
+    VIT_INPUT_CONTRACT_GRID_THW,
     VIT_INPUT_CONTRACT_NATIVE,
+    VIT_INPUT_CONTRACT_STATIC_GRID_THW,
     VIT_INPUT_CONTRACT_TILED_ASPECT_RATIO,
     VIT_INPUT_CONTRACT_WINDOWED_ROPE,
     ViTPluginWrapper,
@@ -53,7 +58,65 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Hugging Face model id or local model path to export.",
     )
+    parser.add_argument(
+        "--model_class",
+        default=None,
+        help=(
+            "Optional import path for a custom model class with from_pretrained, "
+            "for models not registered with Transformers AutoModel."
+        ),
+    )
+    parser.add_argument(
+        "--vision_module",
+        default=None,
+        help=(
+            "Optional dotted module path inside the loaded model to export, "
+            "for example 'backbone.vision_model'."
+        ),
+    )
+    parser.add_argument(
+        "--no_processor",
+        action="store_true",
+        help=(
+            "Skip AutoProcessor and build a synthetic pixel_values tensor directly. "
+            "Use this for standalone vision modules or policy checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--dataclass_kw_only_imports",
+        action="store_true",
+        help=(
+            "Temporarily make dataclass-decorated classes keyword-only while "
+            "importing/loading a custom model class. This can help older packages "
+            "import on Python 3.12 without editing their source."
+        ),
+    )
+    parser.add_argument(
+        "--instantiate_from_config",
+        action="store_true",
+        help=(
+            "For --model_class, load the HF config and call the class constructor "
+            "instead of class.from_pretrained(). Useful when the outer model uses "
+            "nested from_pretrained calls that conflict with HF meta initialization."
+        ),
+    )
+    parser.add_argument(
+        "--add_common_vlm_aliases",
+        action="store_true",
+        help=(
+            "Install process-local compatibility aliases on loaded VLM modules "
+            "for packages that expect common .language_model/.visual attributes."
+        ),
+    )
     parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--processor_model",
+        default=None,
+        help=(
+            "Optional HF model id/path to load the processor from. Defaults to "
+            "--model. Useful when exporting a nested backbone from a larger policy."
+        ),
+    )
     parser.add_argument("--prompt", default="Describe this image.")
     parser.add_argument(
         "--component",
@@ -76,6 +139,15 @@ def parse_args() -> argparse.Namespace:
         "--dtype",
         default="float16",
         choices=("float16", "bfloat16", "float32"),
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        default=None,
+        choices=("eager", "sdpa", "flash_attention_2"),
+        help=(
+            "Optional Hugging Face attention implementation to pass to "
+            "from_pretrained."
+        ),
     )
     parser.add_argument(
         "--save_executorch",
@@ -180,29 +252,283 @@ def model_loader_candidates(prefer_generation_model: bool) -> List[Any]:
     return candidates
 
 
+def import_object(import_path: str) -> Any:
+    module_name, _, object_name = import_path.rpartition(".")
+    if not module_name or not object_name:
+        raise ValueError(
+            f"Expected a dotted import path like package.module.Class, got {import_path!r}."
+        )
+    module = importlib.import_module(module_name)
+    return getattr(module, object_name)
+
+
+def set_attn_implementation_on_config(
+    config: Any,
+    attn_implementation: str,
+) -> None:
+    visited: set[int] = set()
+
+    def visit(value: Any) -> None:
+        if value is None or id(value) in visited:
+            return
+        visited.add(id(value))
+
+        if isinstance(value, dict):
+            children = value.values()
+        elif isinstance(value, (list, tuple)):
+            children = value
+        elif hasattr(value, "__dict__"):
+            for attr_name in (
+                "attn_implementation",
+                "_attn_implementation",
+                "_attn_implementation_internal",
+            ):
+                setattr(value, attr_name, attn_implementation)
+            children = vars(value).values()
+        else:
+            return
+
+        for child in children:
+            visit(child)
+
+    visit(config)
+
+
+def load_config_with_attn_implementation(
+    model_name: str,
+    attn_implementation: str,
+) -> Any:
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    set_attn_implementation_on_config(config, attn_implementation)
+    return config
+
+
+def ensure_tied_weight_keys_compat(model: nn.Module) -> None:
+    if hasattr(model, "all_tied_weights_keys"):
+        return
+
+    tied_keys = getattr(model, "_tied_weights_keys", None)
+    if tied_keys is None:
+        model.all_tied_weights_keys = {}
+    elif isinstance(tied_keys, dict):
+        model.all_tied_weights_keys = tied_keys
+    else:
+        model.all_tied_weights_keys = {key: None for key in tied_keys}
+
+
+@contextmanager
+def force_attn_implementation_during_init(attn_implementation: str | None):
+    if attn_implementation is None:
+        yield
+        return
+
+    from transformers import PreTrainedModel
+
+    original_init = PreTrainedModel.__init__
+
+    def init_with_forced_attn(self, config, *args, **kwargs):
+        set_attn_implementation_on_config(config, attn_implementation)
+        result = original_init(self, config, *args, **kwargs)
+        ensure_tied_weight_keys_compat(self)
+        return result
+
+    PreTrainedModel.__init__ = init_with_forced_attn
+    try:
+        yield
+    finally:
+        PreTrainedModel.__init__ = original_init
+
+
+@contextmanager
+def default_device_for_loading(device: str):
+    get_default_device = getattr(torch, "get_default_device", None)
+    set_default_device = getattr(torch, "set_default_device", None)
+    if get_default_device is None or set_default_device is None:
+        yield
+        return
+
+    previous_device = get_default_device()
+    set_default_device(device)
+    try:
+        yield
+    finally:
+        set_default_device(previous_device)
+
+
+def enable_dataclass_kw_only_import_compat(
+    module_prefixes: Tuple[str, ...],
+) -> None:
+    import dataclasses
+
+    if getattr(dataclasses.dataclass, "_vlm_export_kw_only_compat", False):
+        return
+
+    original_dataclass = dataclasses.dataclass
+
+    def dataclass_compat(cls=None, /, **kwargs):
+        def should_force_kw_only(inner_cls: Any) -> bool:
+            module_name = getattr(inner_cls, "__module__", "")
+            return any(
+                module_name == prefix or module_name.startswith(f"{prefix}.")
+                for prefix in module_prefixes
+            )
+
+        if cls is None:
+            return lambda inner_cls: original_dataclass(
+                inner_cls,
+                **(
+                    {**kwargs, "kw_only": True}
+                    if should_force_kw_only(inner_cls)
+                    else kwargs
+                ),
+            )
+        if should_force_kw_only(cls):
+            kwargs.setdefault("kw_only", True)
+        return original_dataclass(cls, **kwargs)
+
+    dataclass_compat._vlm_export_kw_only_compat = True  # type: ignore[attr-defined]
+    dataclasses.dataclass = dataclass_compat
+
+
+def add_common_vlm_aliases(model: nn.Module) -> nn.Module:
+    if not hasattr(model, "language_model"):
+        language_model = None
+        nested_model = getattr(model, "model", None)
+        if isinstance(nested_model, nn.Module):
+            if hasattr(nested_model, "language_model"):
+                language_model = nested_model.language_model
+            elif hasattr(nested_model, "layers"):
+                language_model = nested_model
+        if isinstance(language_model, nn.Module):
+            model.language_model = language_model
+
+    if not hasattr(model, "visual"):
+        for attr_name in ("vision_model", "visual", "vision_tower"):
+            candidate = getattr(model, attr_name, None)
+            if isinstance(candidate, nn.Module):
+                model.visual = candidate
+                break
+        else:
+            nested_model = getattr(model, "model", None)
+            if isinstance(nested_model, nn.Module):
+                for attr_name in ("visual", "vision_model", "vision_tower"):
+                    candidate = getattr(nested_model, attr_name, None)
+                    if isinstance(candidate, nn.Module):
+                        model.visual = candidate
+                        break
+    return model
+
+
+def enable_common_vlm_alias_hook() -> None:
+    try:
+        from transformers import PreTrainedModel
+    except ImportError:
+        return
+
+    original_from_pretrained = PreTrainedModel.from_pretrained
+    original_from_pretrained_fn = getattr(
+        original_from_pretrained,
+        "__func__",
+        original_from_pretrained,
+    )
+    if getattr(original_from_pretrained_fn, "_vlm_export_common_aliases", False):
+        return
+
+    def from_pretrained_with_aliases(cls, *args, **kwargs):
+        model = original_from_pretrained_fn(cls, *args, **kwargs)
+        return add_common_vlm_aliases(model)
+
+    from_pretrained_with_aliases._vlm_export_common_aliases = True  # type: ignore[attr-defined]
+    PreTrainedModel.from_pretrained = classmethod(from_pretrained_with_aliases)
+
+
 def load_model(
     model_name: str,
     dtype: torch.dtype,
     device: torch.device,
     prefer_generation_model: bool,
+    model_class: str | None = None,
+    dataclass_kw_only_imports: bool = False,
+    instantiate_from_config: bool = False,
+    use_common_vlm_aliases: bool = False,
     move_to_device: bool = True,
+    attn_implementation: str | None = None,
 ) -> nn.Module:
     model_kwargs = {
         "trust_remote_code": True,
         "torch_dtype": dtype,
     }
+    if attn_implementation is not None:
+        model_kwargs["config"] = load_config_with_attn_implementation(
+            model_name,
+            attn_implementation,
+        )
+    if model_class is not None:
+        if dataclass_kw_only_imports:
+            enable_dataclass_kw_only_import_compat(
+                (model_class.split(".", maxsplit=1)[0],)
+            )
+        if use_common_vlm_aliases:
+            enable_common_vlm_alias_hook()
+        loader = import_object(model_class)
+        with torch.no_grad():
+            with default_device_for_loading("cpu"):
+                with force_attn_implementation_during_init(attn_implementation):
+                    if instantiate_from_config:
+                        config = loader.config_class.from_pretrained(
+                            model_name,
+                            trust_remote_code=True,
+                        )
+                        if attn_implementation is not None:
+                            set_attn_implementation_on_config(
+                                config,
+                                attn_implementation,
+                            )
+                        model = loader(config).eval()
+                    else:
+                        model = loader.from_pretrained(model_name, **model_kwargs).eval()
+            if use_common_vlm_aliases:
+                model = add_common_vlm_aliases(model)
+            return model.to(device) if move_to_device else model
+
     last_error: Exception | None = None
     with torch.no_grad():
+        if use_common_vlm_aliases:
+            enable_common_vlm_alias_hook()
         for loader in model_loader_candidates(prefer_generation_model):
             try:
-                model = loader.from_pretrained(
-                    model_name,
-                    **model_kwargs,
-                ).eval()
+                with default_device_for_loading("cpu"):
+                    with force_attn_implementation_during_init(attn_implementation):
+                        model = loader.from_pretrained(
+                            model_name,
+                            **model_kwargs,
+                        ).eval()
+                if use_common_vlm_aliases:
+                    model = add_common_vlm_aliases(model)
                 return model.to(device) if move_to_device else model
             except (KeyError, ValueError, AttributeError) as exc:
                 last_error = exc
     raise ValueError(f"Could not load {model_name!r} with available AutoModel classes.") from last_error
+
+
+def get_nested_module(model: nn.Module, module_path: str) -> nn.Module:
+    current: Any = model
+    for attr_name in module_path.split("."):
+        if not attr_name:
+            raise ValueError(f"Invalid empty path component in {module_path!r}.")
+        if attr_name.isdigit() and isinstance(current, (nn.ModuleList, list, tuple)):
+            current = current[int(attr_name)]
+        else:
+            current = getattr(current, attr_name)
+    if not isinstance(current, nn.Module):
+        raise TypeError(f"{module_path!r} did not resolve to a torch.nn.Module.")
+    return current
+
+
+def get_vision_module(model: nn.Module, module_path: str | None) -> nn.Module:
+    if module_path is not None:
+        return get_nested_module(model, module_path)
+    return get_generic_vision_model(model)
 
 
 def _extract_tensor(output: Any) -> torch.Tensor:
@@ -363,6 +689,16 @@ def has_tiled_aspect_ratio_contract(inputs: Dict[str, torch.Tensor]) -> bool:
     )
 
 
+def has_grid_thw_contract(visual: nn.Module, inputs: Dict[str, torch.Tensor]) -> bool:
+    if not isinstance(inputs.get("image_grid_thw"), torch.Tensor):
+        return False
+    try:
+        signature = inspect.signature(visual.forward)
+    except (TypeError, ValueError):
+        return False
+    return "grid_thw" in signature.parameters
+
+
 def prepare_vision_contract(
     visual: nn.Module,
     inputs: Dict[str, torch.Tensor],
@@ -392,6 +728,17 @@ def prepare_vision_contract(
                 "aspect_ratio_ids": inputs["aspect_ratio_ids"],
                 "attention_mask": attention_mask,
             },
+            0,
+        )
+
+    if has_grid_thw_contract(visual, inputs):
+        # Some HF vision towers branch on grid_thw values internally while
+        # constructing positional embeddings. Keep the sampled grid static for
+        # this fixed-shape export so torch.export does not need to specialize a
+        # data-dependent tensor input.
+        return (
+            VIT_INPUT_CONTRACT_STATIC_GRID_THW,
+            {},
             0,
         )
 
@@ -431,6 +778,15 @@ def call_vision_reference(
                             attention_mask=core_inputs["attention_mask"],
                         )
                     )
+
+        if input_contract in (
+            VIT_INPUT_CONTRACT_GRID_THW,
+            VIT_INPUT_CONTRACT_STATIC_GRID_THW,
+        ):
+            grid_thw = core_inputs.get("grid_thw", processor_inputs["image_grid_thw"])
+            return extract_vision_tensor(
+                visual(pixel_values, grid_thw=grid_thw)
+            )
 
         return extract_vision_tensor(visual(pixel_values))
 
@@ -496,6 +852,27 @@ def prepare_processor_inputs(
         if isinstance(optional_tensor, torch.Tensor):
             metadata[optional_name] = optional_tensor.detach().cpu().tolist()
     return tensor_inputs, metadata
+
+
+def prepare_synthetic_pixel_inputs(
+    image_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    y = torch.linspace(0, 1, image_size, dtype=torch.float32).view(1, image_size, 1)
+    x = torch.linspace(0, 1, image_size, dtype=torch.float32).view(1, 1, image_size)
+    red = x.expand(1, image_size, image_size)
+    green = y.expand(1, image_size, image_size)
+    blue = (red + green) * 0.5
+    pixel_values = torch.stack((red, green, blue), dim=1)
+    pixel_values = (pixel_values - 0.5) / 0.5
+    pixel_values = pixel_values.to(device=device, dtype=dtype).contiguous()
+    metadata = {
+        "input_source": "synthetic_pixel_values",
+        "pixel_values_shape": list(pixel_values.shape),
+        "pixel_values_dtype": str(pixel_values.dtype),
+    }
+    return {"pixel_values": pixel_values}, metadata
 
 
 def prepare_inputs(
@@ -973,18 +1350,28 @@ def main() -> None:
         dtype,
         device,
         prefer_generation_model=False,
+        model_class=args.model_class,
+        dataclass_kw_only_imports=args.dataclass_kw_only_imports,
+        instantiate_from_config=args.instantiate_from_config,
+        use_common_vlm_aliases=args.add_common_vlm_aliases,
         move_to_device=False,
-    )
-    processor = AutoProcessor.from_pretrained(
-        args.model,
-        trust_remote_code=True,
-        use_fast=True,
+        attn_implementation=args.attn_implementation,
     )
 
-    visual = get_generic_vision_model(model).to(device=device, dtype=dtype).eval()
-    processor_inputs, input_metadata = prepare_processor_inputs(
-        processor, args.prompt, args.image_size, device, dtype
-    )
+    visual = get_vision_module(model, args.vision_module).to(device=device, dtype=dtype).eval()
+    if args.no_processor:
+        processor_inputs, input_metadata = prepare_synthetic_pixel_inputs(
+            args.image_size, device, dtype
+        )
+    else:
+        processor = AutoProcessor.from_pretrained(
+            args.processor_model or args.model,
+            trust_remote_code=True,
+            use_fast=True,
+        )
+        processor_inputs, input_metadata = prepare_processor_inputs(
+            processor, args.prompt, args.image_size, device, dtype
+        )
     pixel_values = processor_inputs["pixel_values"]
     input_contract, core_inputs, max_window_seq_len = prepare_vision_contract(
         visual,
@@ -1016,10 +1403,16 @@ def main() -> None:
         use_plugin_op=use_vit_attention_plugin,
     )
     attention_modules = count_vit_plugin_attention_modules(visual)
+    static_grid_thw = (
+        processor_inputs["image_grid_thw"]
+        if input_contract == VIT_INPUT_CONTRACT_STATIC_GRID_THW
+        else None
+    )
     wrapper = ViTPluginWrapper(
         visual,
         input_contract=input_contract,
         max_window_seq_len=max_window_seq_len,
+        static_grid_thw=static_grid_thw,
     ).eval().to(device)
 
     exported_program = export_vision(wrapper, pixel_values, core_inputs)
@@ -1041,6 +1434,9 @@ def main() -> None:
         "component": args.component,
         "format_version": 1,
         "input_contract": input_contract,
+        "model_class": args.model_class,
+        "processor_model": args.processor_model,
+        "vision_module": args.vision_module,
         "uses_vit_attention_plugin": use_vit_attention_plugin,
         "vit_attention_modules": attention_modules,
         "max_window_seq_len": max_window_seq_len,

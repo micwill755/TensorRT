@@ -118,6 +118,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Run a raw TensorRT engine with saved sample tensors and compare output.",
     )
+    parser.add_argument(
+        "--run_bundle",
+        action="store_true",
+        help=(
+            "Run the raw TensorRT engine and sample tensors listed in "
+            "--output_dir/manifest.json."
+        ),
+    )
     parser.add_argument("--verify_atol", type=float, default=2e-1)
     parser.add_argument("--verify_rtol", type=float, default=2e-1)
     parser.add_argument(
@@ -167,15 +175,18 @@ def get_qwen_visual(model: nn.Module) -> nn.Module:
 
 
 def model_loader_candidates(prefer_generation_model: bool) -> List[Any]:
-    candidates: List[Any] = []
-    if prefer_generation_model:
-        for class_name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
-            try:
-                module = __import__("transformers", fromlist=[class_name])
-                candidates.append(getattr(module, class_name))
-            except (ImportError, AttributeError):
-                pass
-    candidates.append(AutoModel)
+    generation_candidates: List[Any] = []
+    for class_name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+        try:
+            module = __import__("transformers", fromlist=[class_name])
+            generation_candidates.append(getattr(module, class_name))
+        except (ImportError, AttributeError):
+            pass
+    candidates: List[Any] = (
+        generation_candidates + [AutoModel]
+        if prefer_generation_model
+        else [AutoModel] + generation_candidates
+    )
     return candidates
 
 
@@ -680,33 +691,80 @@ def _torch_dtype_from_trt(trt_dtype: Any) -> torch.dtype:
     return dtype_map[trt_dtype]
 
 
+def load_manifest(output_dir: Path) -> Dict[str, Any]:
+    manifest_path = output_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError(f"Could not find manifest at {manifest_path}.")
+    return json.loads(manifest_path.read_text())
+
+
+def resolve_run_artifacts(
+    args: argparse.Namespace,
+) -> Tuple[Path, Path, str | None]:
+    manifest: Dict[str, Any] | None = None
+    output_dir = Path(args.output_dir)
+
+    if args.run_bundle:
+        manifest = load_manifest(output_dir)
+        engines = manifest.get("artifacts", {}).get("tensorrt_engines", [])
+        if len(engines) != 1:
+            raise RuntimeError(
+                f"--run_bundle expected exactly one TensorRT engine, found {len(engines)}."
+            )
+        engine_path = output_dir / engines[0]["path"]
+    elif args.run_engine is not None:
+        engine_path = Path(args.run_engine)
+    else:
+        raise RuntimeError("--run_engine or --run_bundle is required.")
+
+    if args.sample_tensors is not None:
+        sample_path = Path(args.sample_tensors)
+    else:
+        if manifest is None and (output_dir / "manifest.json").exists():
+            manifest = load_manifest(output_dir)
+        sample_name = (
+            manifest.get("artifacts", {}).get("sample_tensors")
+            if manifest is not None
+            else None
+        )
+        if sample_name is None:
+            sample_path = output_dir / "qwen_vision_test_tensors.pt"
+        else:
+            sample_path = output_dir / sample_name
+
+    plugin_path = args.plugin_path
+    if plugin_path is None and manifest is not None:
+        plugin_path = (
+            manifest.get("runtime_requirements", {}) or {}
+        ).get("tensorrt_plugin_path")
+
+    return engine_path, sample_path, plugin_path
+
+
 def run_raw_tensorrt_engine(args: argparse.Namespace) -> None:
     try:
         import tensorrt as trt
     except ImportError as exc:
         raise RuntimeError("TensorRT Python bindings are required for --run_engine.") from exc
 
-    if args.plugin_path is None:
+    engine_path, sample_path, plugin_path = resolve_run_artifacts(args)
+
+    if plugin_path is None:
         raise RuntimeError("--plugin_path is required to run an engine with ViTAttentionPlugin.")
 
-    sample_path = (
-        Path(args.sample_tensors)
-        if args.sample_tensors is not None
-        else Path(args.output_dir) / "qwen_vision_test_tensors.pt"
-    )
     if not sample_path.exists():
         raise RuntimeError(
             f"Could not find sample tensors at {sample_path}. Rerun export with "
             "--save_sample_tensors first."
         )
 
-    ctypes.CDLL(args.plugin_path)
+    ctypes.CDLL(plugin_path)
     logger = trt.Logger(trt.Logger.INFO)
     runtime = trt.Runtime(logger)
-    engine_bytes = Path(args.run_engine).read_bytes()
+    engine_bytes = engine_path.read_bytes()
     engine = runtime.deserialize_cuda_engine(engine_bytes)
     if engine is None:
-        raise RuntimeError(f"TensorRT failed to deserialize {args.run_engine}.")
+        raise RuntimeError(f"TensorRT failed to deserialize {engine_path}.")
 
     samples = torch.load(sample_path, map_location="cpu")
     device = torch.device(args.device)
@@ -1024,7 +1082,7 @@ def tensor_specs(tensors: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, Any]]:
 
 def main() -> None:
     args = parse_args()
-    if args.run_engine is not None:
+    if args.run_engine is not None or args.run_bundle:
         run_raw_tensorrt_engine(args)
         return
 

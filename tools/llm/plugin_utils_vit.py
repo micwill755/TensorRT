@@ -32,6 +32,9 @@ DEFAULT_PLUGIN_PATH = os.path.join(
 
 # Global configuration for ViT plugin converter
 _VIT_PLUGIN_CONFIG: Dict[str, Any] = {}
+VIT_MASK_TYPE_DENSE_ADDITIVE = 0
+VIT_MASK_TYPE_PACKED_CU_SEQLENS = 1
+VIT_MASK_TYPE_COMPACT_BLOCK = 2
 
 def load_plugin(plugin_path: Optional[str] = None) -> bool:
     """
@@ -61,6 +64,7 @@ def set_vit_plugin_config(
     max_batch_size: int = 4,
     mask_type: int = 0,
     max_seq_len: int = 0,
+    mask_block_size: int = 0,
 ) -> None:
     """
     Set global configuration for the ViT plugin converter.
@@ -70,8 +74,11 @@ def set_vit_plugin_config(
         head_dim: Dimension of each attention head.
         num_patches: Number of image patches (including [CLS] token).
         max_batch_size: Maximum batch size.
-        mask_type: Plugin mask mode. 0=dense additive mask, 1=packed cu_seqlens.
+        mask_type: Plugin mask mode. 0=dense additive mask, 1=packed cu_seqlens,
+            2=compact block validity mask.
         max_seq_len: Maximum packed segment length for cu_seqlens FMHA.
+        mask_block_size: Number of sequence tokens represented by one compact
+            block-mask element when mask_type=2.
     """
     global _VIT_PLUGIN_CONFIG
     _VIT_PLUGIN_CONFIG = {
@@ -81,6 +88,7 @@ def set_vit_plugin_config(
         "max_batch_size": max_batch_size,
         "mask_type": mask_type,
         "max_seq_len": max_seq_len,
+        "mask_block_size": mask_block_size,
     }
 
 def get_vit_plugin_config() -> Dict[str, Any]:
@@ -147,6 +155,7 @@ def _register_vit_plugin_op_impl() -> None:
         qkv_fused: int = 1,
         mask_type: int = 0,
         max_seq_len: int = 0,
+        mask_block_size: int = 0,
     ) -> torch.Tensor:
         """
         ViT attention operation.
@@ -159,8 +168,10 @@ def _register_vit_plugin_op_impl() -> None:
             num_heads: Number of attention heads.
             head_dim: Dimension per head.
             qkv_fused: Whether QKV is fused (1=yes, 0=no).
-            mask_type: 0 for dense additive mask, 1 for packed cu_seqlens.
+            mask_type: 0 for dense additive mask, 1 for packed cu_seqlens,
+                2 for compact block validity mask.
             max_seq_len: Max segment length when mask_type=1.
+            mask_block_size: Tokens per compact mask block when mask_type=2.
 
         Returns:
             Attention output of shape [B, S, H*D].
@@ -173,7 +184,7 @@ def _register_vit_plugin_op_impl() -> None:
         return attn_out
 
     @torch.library.register_fake("tensorrt_vit::attention")
-    def _(qkv, cos, sin, mask_or_cu_seqlens, num_heads, head_dim, qkv_fused=1, mask_type=0, max_seq_len=0):
+    def _(qkv, cos, sin, mask_or_cu_seqlens, num_heads, head_dim, qkv_fused=1, mask_type=0, max_seq_len=0, mask_block_size=0):
         batch_size, seq_len, _ = qkv.shape
         output_dim = num_heads * head_dim
         attn_out = torch.empty(
@@ -250,6 +261,14 @@ class ViTPluginAttention(nn.Module):
         self.output_proj = self._detect_output_projection(original_attn)
         self.num_heads = self._detect_num_heads(original_attn, config)
         self.head_dim = self._detect_head_dim(original_attn, config, self.num_heads)
+        self.q_norm = self._detect_optional_norm(
+            original_attn,
+            ("q_norm", "query_norm", "q_layernorm", "query_layernorm"),
+        )
+        self.k_norm = self._detect_optional_norm(
+            original_attn,
+            ("k_norm", "key_norm", "k_layernorm", "key_layernorm"),
+        )
 
     def _detect_projection_layout(self, original_attn: nn.Module) -> str:
         if hasattr(original_attn, "qkv"):
@@ -304,6 +323,40 @@ class ViTPluginAttention(nn.Module):
             raise ValueError("Could not infer hidden size for ViT plugin head_dim.")
         return hidden_size // num_heads
 
+    def _detect_optional_norm(
+        self, original_attn: nn.Module, names: Tuple[str, ...]
+    ) -> Optional[nn.Module]:
+        for name in names:
+            norm = getattr(original_attn, name, None)
+            if isinstance(norm, nn.Module):
+                return norm
+        return None
+
+    def _norm_last_dim(self, norm: nn.Module) -> Optional[int]:
+        normalized_shape = getattr(norm, "normalized_shape", None)
+        if isinstance(normalized_shape, int):
+            return normalized_shape
+        if isinstance(normalized_shape, (tuple, list)) and normalized_shape:
+            return int(normalized_shape[-1])
+        weight = getattr(norm, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.dim() > 0:
+            return int(weight.shape[-1])
+        return None
+
+    def _apply_optional_norm(
+        self, tensor: torch.Tensor, norm: Optional[nn.Module]
+    ) -> torch.Tensor:
+        if norm is None:
+            return tensor
+
+        batch_size, seq_len, hidden_size = tensor.shape
+        norm_last_dim = self._norm_last_dim(norm)
+        if norm_last_dim == self.head_dim:
+            tensor = tensor.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+            tensor = norm(tensor)
+            return tensor.reshape(batch_size, seq_len, hidden_size)
+        return norm(tensor)
+
     def _project_qkv(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.projection_layout == "fused_qkv":
             return self.original_attn.qkv(hidden_states)
@@ -311,11 +364,15 @@ class ViTPluginAttention(nn.Module):
             q = self.original_attn.q_proj(hidden_states)
             k = self.original_attn.k_proj(hidden_states)
             v = self.original_attn.v_proj(hidden_states)
+            q = self._apply_optional_norm(q, self.q_norm)
+            k = self._apply_optional_norm(k, self.k_norm)
             return torch.cat([q, k, v], dim=-1)
 
         q = self.original_attn.query(hidden_states)
         k = self.original_attn.key(hidden_states)
         v = self.original_attn.value(hidden_states)
+        q = self._apply_optional_norm(q, self.q_norm)
+        k = self._apply_optional_norm(k, self.k_norm)
         return torch.cat([q, k, v], dim=-1)
 
     def _get_rope_tensors(
@@ -355,6 +412,12 @@ class ViTPluginAttention(nn.Module):
 
         if attention_mask.dim() == 1 and attention_mask.dtype == torch.int32:
             return attention_mask
+        if (
+            attention_mask.dim() == 2
+            and attention_mask.dtype in (torch.int32, torch.bool)
+            and seq_len % attention_mask.shape[-1] == 0
+        ):
+            return attention_mask.to(device=device, dtype=torch.int32)
 
         attention_mask = attention_mask.to(dtype=dtype)
         if attention_mask.dim() == 4:
@@ -367,6 +430,32 @@ class ViTPluginAttention(nn.Module):
                     attention_mask.shape[3],
                 )
         return attention_mask
+
+    def _compact_block_mask_to_dense(
+        self,
+        block_mask: torch.Tensor,
+        seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        num_blocks = block_mask.shape[-1]
+        if num_blocks <= 0 or seq_len % num_blocks != 0:
+            raise ValueError(
+                "Compact block mask requires seq_len to be divisible by the number of blocks."
+            )
+        block_size = seq_len // num_blocks
+        token_mask = block_mask.to(device=device, dtype=torch.bool).repeat_interleave(
+            block_size,
+            dim=-1,
+        )
+        dense_mask = torch.zeros(
+            token_mask.shape[0],
+            seq_len,
+            seq_len,
+            dtype=dtype,
+            device=device,
+        )
+        return dense_mask.masked_fill(~token_mask.unsqueeze(1), torch.finfo(dtype).min)
 
     def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         x1 = x[..., : x.shape[-1] // 2]
@@ -425,11 +514,21 @@ class ViTPluginAttention(nn.Module):
             hidden_states.dtype,
             hidden_states.device,
         )
-        mask_type = 0
+        mask_type = VIT_MASK_TYPE_DENSE_ADDITIVE
+        mask_block_size = 0
         if attention_mask.dim() == 1 and attention_mask.dtype == torch.int32:
-            mask_type = 1
+            mask_type = VIT_MASK_TYPE_PACKED_CU_SEQLENS
             if max_seq_len <= 0:
                 max_seq_len = seq_len
+        elif attention_mask.dim() == 2 and attention_mask.dtype == torch.int32:
+            num_blocks = attention_mask.shape[-1]
+            if num_blocks <= 0 or seq_len % num_blocks != 0:
+                raise ValueError(
+                    "Compact block attention mask requires seq_len to be divisible "
+                    "by the number of blocks."
+                )
+            mask_type = VIT_MASK_TYPE_COMPACT_BLOCK
+            mask_block_size = seq_len // num_blocks
 
         if self.use_plugin_op:
             attn_out = torch.ops.tensorrt_vit.attention.default(
@@ -442,10 +541,18 @@ class ViTPluginAttention(nn.Module):
                 1,
                 mask_type,
                 max_seq_len,
+                mask_block_size,
             )
         else:
-            if mask_type == 1:
+            if mask_type == VIT_MASK_TYPE_PACKED_CU_SEQLENS:
                 raise ValueError("PyTorch reference attention requires a dense mask.")
+            if mask_type == VIT_MASK_TYPE_COMPACT_BLOCK:
+                attention_mask = self._compact_block_mask_to_dense(
+                    attention_mask,
+                    seq_len,
+                    hidden_states.dtype,
+                    hidden_states.device,
+                )
             attn_out = self._torch_attention(qkv, cos, sin, attention_mask)
         output = self.output_proj(attn_out)
         output = output.squeeze(0) if squeeze_batch else output
@@ -572,6 +679,22 @@ def _forward_tiled_aspect_ratio_vision(
     aspect_ratio_ids = aspect_ratio_ids.reshape(
         batch_size * num_concurrent_media, -1
     )
+    if attention_mask.dim() == 3:
+        compact_attention_mask = attention_mask.reshape(
+            batch_size * num_concurrent_media,
+            -1,
+        )
+    elif attention_mask.dim() == 2:
+        compact_attention_mask = attention_mask
+    else:
+        raise ValueError(
+            "Tiled aspect-ratio vision requires a compact mask with shape "
+            "[B, media, tiles] or [B*media, tiles]."
+        )
+    compact_attention_mask = compact_attention_mask.to(
+        device=pixel_values.device,
+        dtype=torch.int32,
+    )
 
     target_dtype = vision.patch_embedding.weight.dtype
     target_device = vision.patch_embedding.weight.device
@@ -624,7 +747,7 @@ def _forward_tiled_aspect_ratio_vision(
     hidden_state = hidden_state.view(batch_size * num_concurrent_media, -1, dim)
     output = vision.transformer(
         hidden_state,
-        attention_mask=attention_mask,
+        attention_mask=compact_attention_mask,
     )
     hidden_state = output.last_hidden_state
     hidden_state = vision.layernorm_post(hidden_state)
@@ -646,7 +769,7 @@ def _forward_tiled_aspect_ratio_vision(
     )
     global_output = vision.global_transformer(
         hidden_state,
-        attention_mask=attention_mask,
+        attention_mask=compact_attention_mask,
     )
     hidden_state = global_output.last_hidden_state
 
@@ -815,6 +938,7 @@ def replace_vit_attention_with_plugin(
                     config,
                     layer_idx,
                     return_tuple=True,
+                    use_plugin_op=use_plugin_op,
                 )
                 layer_idx += 1
                 replacement_count += 1

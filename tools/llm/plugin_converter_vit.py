@@ -44,8 +44,18 @@ def _as_int(value, default):
         return default
 
 
+def _shape_rank(value):
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return None
+    try:
+        return len(shape)
+    except TypeError:
+        return None
+
+
 def _infer_mask_type(mask_arg, default):
-    """Infer cu_seqlens mode when the fourth plugin input is an INT32 tensor."""
+    """Infer compact mask modes from the fourth plugin input when possible."""
     dtype = getattr(mask_arg, "dtype", None)
     dtype_name = str(dtype).lower()
     if (
@@ -54,7 +64,11 @@ def _infer_mask_type(mask_arg, default):
         or dtype == trt.DataType.INT32
         or "int32" in dtype_name
     ):
-        return 1
+        rank = _shape_rank(mask_arg)
+        if rank == 1:
+            return 1
+        if rank == 2:
+            return 2
     return default
 
 
@@ -70,6 +84,7 @@ def convert_vit_attention(ctx: ConversionContext, target, args, kwargs, name):
     qkv_fused = args[6] if len(args) > 6 else kwargs.get("qkv_fused", 1)
     mask_type = args[7] if len(args) > 7 else kwargs.get("mask_type", 0)
     max_seq_len = args[8] if len(args) > 8 else kwargs.get("max_seq_len", 0)
+    mask_block_size = args[9] if len(args) > 9 else kwargs.get("mask_block_size", 0)
 
     creator = trt.get_plugin_registry().get_plugin_creator(
         "ViTAttentionPlugin", "1", ""
@@ -106,9 +121,13 @@ def convert_vit_attention(ctx: ConversionContext, target, args, kwargs, name):
     qkv_fused_val = _as_int(qkv_fused, 1)
     inferred_mask_type = _infer_mask_type(mask_tensor, config.get("mask_type", 0))
     mask_type_val = _as_int(mask_type, inferred_mask_type)
-    if inferred_mask_type == 1:
-        mask_type_val = 1
+    if mask_type_val == 0 and inferred_mask_type in (1, 2):
+        mask_type_val = inferred_mask_type
     max_seq_len_val = _as_int(max_seq_len, config.get("max_seq_len", 0))
+    mask_block_size_val = _as_int(
+        mask_block_size,
+        config.get("mask_block_size", 0),
+    )
     field_list = [
         trt.PluginField(
             "num_heads",
@@ -133,6 +152,11 @@ def convert_vit_attention(ctx: ConversionContext, target, args, kwargs, name):
         trt.PluginField(
             "max_seq_len",
             np.array([max_seq_len_val], dtype=np.int32),
+            trt.PluginFieldType.INT32,
+        ),
+        trt.PluginField(
+            "mask_block_size",
+            np.array([mask_block_size_val], dtype=np.int32),
             trt.PluginFieldType.INT32,
         ),
     ]

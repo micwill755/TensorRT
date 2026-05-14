@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 from PIL import Image
@@ -70,6 +71,22 @@ def parse_args() -> argparse.Namespace:
         help="Compile the exported vision tower with Torch-TensorRT and save it.",
     )
     parser.add_argument(
+        "--input_export",
+        default=None,
+        help=(
+            "Load an existing torch.export .pt2 and compile it with Torch-TensorRT. "
+            "When set, model loading/export is skipped."
+        ),
+    )
+    parser.add_argument(
+        "--input_manifest",
+        default=None,
+        help=(
+            "Manifest from a previous export run. Defaults to manifest.json next to "
+            "--input_export when compiling an existing export."
+        ),
+    )
+    parser.add_argument(
         "--plugin_path",
         default=None,
         help="Optional path to libNvInfer_edgellm_plugin.so.",
@@ -91,6 +108,18 @@ def dtype_from_name(name: str) -> torch.dtype:
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
     }[name]
+
+
+def dtype_from_string(name: str) -> torch.dtype:
+    normalized = name.removeprefix("torch.")
+    if normalized in ("float16", "bfloat16", "float32"):
+        return dtype_from_name(normalized)
+    return {
+        "int32": torch.int32,
+        "int64": torch.int64,
+        "long": torch.long,
+        "bool": torch.bool,
+    }[normalized]
 
 
 def get_qwen_visual(model: nn.Module) -> nn.Module:
@@ -301,12 +330,11 @@ def save_executorch_program(
 
 def compile_and_save_torchtrt(
     exported_program: torch.export.ExportedProgram,
-    example_inputs: Tuple[torch.Tensor, ...],
-    example_kwargs: Dict[str, torch.Tensor],
+    compile_inputs: List[Any],
     output_path: Path,
     device: torch.device,
     plugin_path: str | None,
-) -> None:
+) -> List[Dict[str, Any]]:
     try:
         import torch_tensorrt
     except ImportError as exc:
@@ -334,13 +362,6 @@ def compile_and_save_torchtrt(
     trt_device = torch_tensorrt.Device(f"cuda:{device_index}")
 
     load_plugin(plugin_path)
-    compile_inputs = [
-        torch_tensorrt.Input(
-            shape=tuple(tensor.shape),
-            dtype=tensor.dtype,
-        )
-        for tensor in list(example_inputs) + list(example_kwargs.values())
-    ]
 
     trt_model = torch_tensorrt.dynamo.compile(
         exported_program,
@@ -351,7 +372,187 @@ def compile_and_save_torchtrt(
         device=trt_device,
         min_block_size=1,
     )
+    engine_entries = save_raw_tensorrt_engines(trt_model, output_path.parent)
     torch_tensorrt.save(trt_model, str(output_path), retrace=False)
+    return engine_entries
+
+
+def compile_inputs_from_tensors(
+    example_inputs: Tuple[torch.Tensor, ...],
+    example_kwargs: Dict[str, torch.Tensor],
+) -> List[Any]:
+    import torch_tensorrt
+
+    return [
+        torch_tensorrt.Input(
+            shape=tuple(tensor.shape),
+            dtype=tensor.dtype,
+        )
+        for tensor in list(example_inputs) + list(example_kwargs.values())
+    ]
+
+
+def _manifest_tensor_specs(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    specs: Dict[str, Dict[str, Any]] = {}
+    inputs = manifest.get("inputs", {})
+    pixel_shape = inputs.get("pixel_values_shape")
+    pixel_dtype = inputs.get("pixel_values_dtype")
+    if pixel_shape is not None and pixel_dtype is not None:
+        specs["pixel_values"] = {
+            "shape": pixel_shape,
+            "dtype": pixel_dtype,
+        }
+    specs.update(manifest.get("core_inputs", {}))
+    return specs
+
+
+def _candidate_input_names(name: str) -> List[str]:
+    candidates = [name]
+    if name.startswith("arg"):
+        candidates.append(name[3:])
+    if "_" in name:
+        candidates.append(name.split("_", 1)[1])
+    return candidates
+
+
+def compile_inputs_from_manifest(
+    exported_program: torch.export.ExportedProgram,
+    manifest: Dict[str, Any],
+) -> List[Any]:
+    import torch_tensorrt
+
+    specs = _manifest_tensor_specs(manifest)
+    graph_signature = getattr(exported_program, "graph_signature", None)
+    user_inputs = list(getattr(graph_signature, "user_inputs", ()))
+    if not user_inputs:
+        user_inputs = ["pixel_values", *manifest.get("core_inputs", {}).keys()]
+
+    compile_inputs: List[Any] = []
+    missing: List[str] = []
+    for name in user_inputs:
+        spec = None
+        for candidate in _candidate_input_names(str(name)):
+            if candidate in specs:
+                spec = specs[candidate]
+                break
+        if spec is None:
+            missing.append(str(name))
+            continue
+
+        compile_inputs.append(
+            torch_tensorrt.Input(
+                shape=tuple(spec["shape"]),
+                dtype=dtype_from_string(spec["dtype"]),
+            )
+        )
+
+    if missing:
+        raise RuntimeError(
+            "Could not infer Torch-TensorRT input specs for exported inputs "
+            f"{missing}. Known manifest tensors: {sorted(specs.keys())}"
+        )
+    return compile_inputs
+
+
+def _safe_artifact_name(name: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip("_"))
+    return sanitized or "tensorrt_engine"
+
+
+def save_raw_tensorrt_engines(
+    trt_model: nn.Module,
+    output_dir: Path,
+) -> List[Dict[str, Any]]:
+    engine_dir = output_dir / "engines"
+    engine_dir.mkdir(parents=True, exist_ok=True)
+
+    entries: List[Dict[str, Any]] = []
+    for module_name, module in trt_model.named_modules():
+        serialized_engine = getattr(module, "serialized_engine", None)
+        if not serialized_engine:
+            continue
+
+        engine_path = engine_dir / f"{_safe_artifact_name(module_name)}.engine"
+        engine_bytes = bytes(serialized_engine)
+        engine_path.write_bytes(engine_bytes)
+        entries.append(
+            {
+                "name": module_name,
+                "path": str(engine_path.relative_to(output_dir)),
+                "bytes": len(engine_bytes),
+                "input_binding_names": list(
+                    getattr(module, "input_binding_names", [])
+                ),
+                "output_binding_names": list(
+                    getattr(module, "output_binding_names", [])
+                ),
+            }
+        )
+
+    if not entries:
+        raise RuntimeError("Torch-TensorRT compile did not produce any serialized engines.")
+    return entries
+
+
+def load_manifest_for_export(args: argparse.Namespace, export_path: Path) -> Dict[str, Any]:
+    manifest_path = (
+        Path(args.input_manifest)
+        if args.input_manifest is not None
+        else export_path.parent / "manifest.json"
+    )
+    if not manifest_path.exists():
+        raise RuntimeError(
+            f"Could not find manifest for {export_path}. Pass --input_manifest explicitly."
+        )
+    return json.loads(manifest_path.read_text())
+
+
+def add_runtime_requirements(
+    manifest: Dict[str, Any],
+    plugin_path: str | None,
+) -> None:
+    manifest["runtime_requirements"] = {
+        "custom_op_module": "plugin_utils_vit",
+        "tensorrt_plugin_path": plugin_path,
+        "load_order": [
+            "import torch_tensorrt",
+            "import plugin_utils_vit",
+            "ctypes.CDLL(tensorrt_plugin_path)",
+            "torch_tensorrt.load(torch_tensorrt_artifact)",
+        ],
+    }
+
+
+def compile_existing_export(args: argparse.Namespace) -> None:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    export_path = Path(args.input_export)
+    manifest = load_manifest_for_export(args, export_path)
+    exported_program = torch.export.load(export_path)
+    compile_inputs = compile_inputs_from_manifest(exported_program, manifest)
+
+    trt_path = output_dir / "qwen_vision_torchtrt.pt2"
+    engine_entries = compile_and_save_torchtrt(
+        exported_program,
+        compile_inputs,
+        trt_path,
+        torch.device(args.device),
+        args.plugin_path,
+    )
+
+    manifest.setdefault("artifacts", {})
+    try:
+        manifest["artifacts"]["torch_export"] = str(export_path.relative_to(output_dir))
+    except ValueError:
+        manifest["artifacts"]["torch_export"] = str(export_path)
+    manifest["artifacts"]["torch_tensorrt"] = trt_path.name
+    manifest["artifacts"]["tensorrt_engines"] = engine_entries
+    add_runtime_requirements(manifest, args.plugin_path)
+    write_manifest(output_dir, manifest)
+
+    print(f"Compiled {export_path} to {trt_path}")
+    print(json.dumps(manifest, indent=2, sort_keys=True))
 
 
 def write_manifest(output_dir: Path, manifest: Dict[str, Any]) -> None:
@@ -362,6 +563,10 @@ def write_manifest(output_dir: Path, manifest: Dict[str, Any]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.input_export is not None:
+        compile_existing_export(args)
+        return
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -441,15 +646,20 @@ def main() -> None:
 
     if args.compile_torchtrt:
         trt_path = output_dir / "qwen_vision_torchtrt.pt2"
-        compile_and_save_torchtrt(
-            exported_program,
+        compile_inputs = compile_inputs_from_tensors(
             (pixel_values,),
             core_inputs,
+        )
+        engine_entries = compile_and_save_torchtrt(
+            exported_program,
+            compile_inputs,
             trt_path,
             device,
             args.plugin_path,
         )
         manifest["artifacts"]["torch_tensorrt"] = trt_path.name
+        manifest["artifacts"]["tensorrt_engines"] = engine_entries
+        add_runtime_requirements(manifest, args.plugin_path)
 
     write_manifest(output_dir, manifest)
     print(f"Saved artifacts to {output_dir}")

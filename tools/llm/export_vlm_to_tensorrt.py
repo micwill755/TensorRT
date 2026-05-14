@@ -36,30 +36,30 @@ from plugin_utils_vit import (
 )
 from utils import (
     extract_vision_tensor,
-    get_qwen_position_ids,
     get_vision_model as get_generic_vision_model,
 )
 
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
+DEFAULT_OUTPUT_DIR = "/tmp/vlm_vision_tensorrt_artifacts"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export Qwen2.5-VL vision tower through torch.export / ExecuTorch."
+        description="Export a VLM vision tower through torch.export and Torch-TensorRT."
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--output_dir", default="/tmp/qwen_executorch_artifacts")
+    parser.add_argument(
+        "--model",
+        required=False,
+        default=None,
+        help="Hugging Face model id or local model path to export.",
+    )
+    parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--prompt", default="Describe this image.")
     parser.add_argument(
         "--component",
         default="vision",
-        choices=("vision", "vlm_prefill"),
-        help=(
-            "Artifact to export. 'vision' exports the visual tower only; "
-            "'vlm_prefill' exports one full VLM prefill forward ending at "
-            "last-token logits."
-        ),
+        choices=("vision",),
+        help="Artifact to export. Currently exports the model's vision tower.",
     )
     parser.add_argument(
         "--image_size",
@@ -137,8 +137,8 @@ def parse_args() -> argparse.Namespace:
         "--no_vit_attention_plugin",
         action="store_true",
         help=(
-            "Replace Qwen attention with the Python fallback wrapper instead of "
-            "the TensorRT ViT attention plugin custom op."
+            "Replace supported vision attention with the Python fallback wrapper "
+            "instead of the TensorRT ViT attention plugin custom op."
         ),
     )
     return parser.parse_args()
@@ -162,16 +162,6 @@ def dtype_from_string(name: str) -> torch.dtype:
         "long": torch.long,
         "bool": torch.bool,
     }[normalized]
-
-
-def get_qwen_visual(model: nn.Module) -> nn.Module:
-    for owner in (model, getattr(model, "model", None)):
-        if owner is None:
-            continue
-        visual = getattr(owner, "visual", None)
-        if isinstance(visual, nn.Module):
-            return visual
-    raise ValueError("Could not find Qwen visual tower at model.visual or model.model.visual")
 
 
 def model_loader_candidates(prefer_generation_model: bool) -> List[Any]:
@@ -213,44 +203,6 @@ def load_model(
             except (KeyError, ValueError, AttributeError) as exc:
                 last_error = exc
     raise ValueError(f"Could not load {model_name!r} with available AutoModel classes.") from last_error
-
-
-def get_qwen_language_model(model: nn.Module) -> nn.Module:
-    for owner in (model, getattr(model, "model", None)):
-        if owner is None:
-            continue
-        language_model = getattr(owner, "language_model", None)
-        if isinstance(language_model, nn.Module):
-            return language_model
-    for attr_name in ("language_model", "model"):
-        language_model = getattr(model, attr_name, None)
-        if isinstance(language_model, nn.Module) and language_model is not model:
-            return language_model
-    raise ValueError("Could not find Qwen language model.")
-
-
-def get_input_embedding_layer(model: nn.Module, language_model: nn.Module) -> nn.Module:
-    for owner in (language_model, model):
-        if hasattr(owner, "get_input_embeddings"):
-            emb = owner.get_input_embeddings()
-            if isinstance(emb, nn.Module):
-                return emb
-    raise ValueError("Could not find Qwen input embedding layer.")
-
-
-def get_lm_head(model: nn.Module, language_model: nn.Module) -> nn.Module:
-    for owner in (model, language_model):
-        lm_head = getattr(owner, "lm_head", None)
-        if isinstance(lm_head, nn.Module):
-            return lm_head
-    raise ValueError("Could not find Qwen lm_head.")
-
-
-def get_image_token_id(model: nn.Module) -> int:
-    image_token_id = getattr(model.config, "image_token_id", None)
-    if image_token_id is None:
-        raise ValueError("Could not find model.config.image_token_id.")
-    return int(image_token_id)
 
 
 def _extract_tensor(output: Any) -> torch.Tensor:
@@ -312,7 +264,7 @@ def _infer_patch_count(vision_config: Any, pixel_values: torch.Tensor) -> int:
     return int((image_h // patch_h) * (image_w // patch_w) + 1)
 
 
-def set_vit_plugin_config_from_qwen_visual(
+def set_vit_plugin_config_from_visual(
     visual: nn.Module, pixel_values: torch.Tensor
 ) -> None:
     vision_config = getattr(visual, "config", None)
@@ -346,7 +298,7 @@ def make_windowed_rope_core_inputs(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Dict[str, torch.Tensor], int]:
-    """Precompute Qwen window/RoPE tensors outside torch.export tracing."""
+    """Precompute window/RoPE tensors outside torch.export tracing."""
 
     with torch.no_grad():
         rotary_pos_emb = visual.rot_pos_emb(image_grid_thw)
@@ -573,79 +525,6 @@ def export_vision(
         )
 
 
-class QwenVlmPrefillWrapper(nn.Module):
-    """Full Qwen VLM prefill wrapper ending at last-token logits."""
-
-    def __init__(
-        self,
-        vision: nn.Module,
-        embeddings: nn.Module,
-        language_model: nn.Module,
-        lm_head: nn.Module,
-        image_token_id: int,
-    ) -> None:
-        super().__init__()
-        self.vision = vision
-        self.embeddings = embeddings
-        self.language_model = language_model
-        self.lm_head = lm_head
-        self.image_token_id = image_token_id
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        pixel_values: torch.Tensor,
-        position_ids: torch.Tensor,
-        rotary_pos_emb: torch.Tensor,
-        attention_mask: torch.Tensor,
-        window_attention_mask: torch.Tensor,
-        cu_window_seqlens: torch.Tensor,
-        window_index: torch.Tensor,
-        reverse_window_index: torch.Tensor,
-    ) -> torch.Tensor:
-        image_embeds = self.vision(
-            pixel_values,
-            rotary_pos_emb=rotary_pos_emb,
-            attention_mask=attention_mask,
-            window_attention_mask=window_attention_mask,
-            cu_window_seqlens=cu_window_seqlens,
-            window_index=window_index,
-            reverse_window_index=reverse_window_index,
-        )
-        inputs_embeds = self.embeddings(input_ids)
-        image_mask = input_ids == self.image_token_id
-        inputs_embeds = inputs_embeds.masked_scatter(
-            image_mask.unsqueeze(-1).expand_as(inputs_embeds),
-            image_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype),
-        )
-        output = self.language_model(
-            inputs_embeds=inputs_embeds,
-            position_ids=position_ids,
-        )
-        hidden_states = (
-            output.last_hidden_state
-            if hasattr(output, "last_hidden_state")
-            else output[0] if isinstance(output, (tuple, list)) else output
-        )
-        return self.lm_head(hidden_states[:, -1, :])
-
-
-def export_vlm_prefill(
-    wrapper: nn.Module,
-    input_ids: torch.Tensor,
-    pixel_values: torch.Tensor,
-    position_ids: torch.Tensor,
-    core_inputs: Dict[str, torch.Tensor],
-) -> torch.export.ExportedProgram:
-    with torch.no_grad():
-        return torch.export.export(
-            wrapper,
-            args=(input_ids, pixel_values, position_ids),
-            kwargs=core_inputs,
-            strict=False,
-        )
-
-
 def save_executorch_program(
     exported_program: torch.export.ExportedProgram, output_path: Path
 ) -> None:
@@ -728,7 +607,7 @@ def resolve_run_artifacts(
             else None
         )
         if sample_name is None:
-            sample_path = output_dir / "qwen_vision_test_tensors.pt"
+            sample_path = output_dir / "vision_test_tensors.pt"
         else:
             sample_path = output_dir / sample_name
 
@@ -1016,22 +895,12 @@ def add_runtime_requirements(
     }
 
 
-def maybe_register_sdpa_converter(model_name: str, model_config: Any | None) -> None:
-    try:
-        from torchtrt_ext import register_sdpa
-    except ImportError:
-        return
-    register_sdpa.enable_sdpa_converter(model_name, model_config)
-
-
 def compile_existing_export(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     export_path = Path(args.input_export)
     manifest = load_manifest_for_export(args, export_path)
-    if manifest.get("component") == "vlm_prefill":
-        maybe_register_sdpa_converter(manifest.get("model", args.model), None)
     exported_program = torch.export.load(export_path)
     compile_inputs = compile_inputs_from_manifest(exported_program, manifest)
 
@@ -1090,6 +959,9 @@ def main() -> None:
         compile_existing_export(args)
         return
 
+    if args.model is None:
+        raise RuntimeError("--model is required when exporting a new artifact.")
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1100,8 +972,8 @@ def main() -> None:
         args.model,
         dtype,
         device,
-        prefer_generation_model=args.component == "vlm_prefill",
-        move_to_device=args.component != "vision",
+        prefer_generation_model=False,
+        move_to_device=False,
     )
     processor = AutoProcessor.from_pretrained(
         args.model,
@@ -1114,9 +986,6 @@ def main() -> None:
         processor, args.prompt, args.image_size, device, dtype
     )
     pixel_values = processor_inputs["pixel_values"]
-    image_grid_thw = processor_inputs.get("image_grid_thw")
-    input_ids = processor_inputs.get("input_ids")
-    attention_mask = processor_inputs.get("attention_mask")
     input_contract, core_inputs, max_window_seq_len = prepare_vision_contract(
         visual,
         processor_inputs,
@@ -1126,42 +995,16 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        if args.component == "vision":
-            reference = call_vision_reference(
-                visual,
-                pixel_values,
-                processor_inputs,
-                input_contract,
-                core_inputs,
-            )
-        else:
-            if input_contract != VIT_INPUT_CONTRACT_WINDOWED_ROPE:
-                raise ValueError(
-                    "--component vlm_prefill currently supports Qwen-style "
-                    "windowed-RoPE VLMs only. Use --component vision for Llama vision."
-                )
-            if input_ids is None or image_grid_thw is None:
-                raise ValueError("Qwen VLM prefill requires input_ids and image_grid_thw.")
-            reference_output = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-            )
-            if hasattr(reference_output, "logits"):
-                reference = reference_output.logits[:, -1, :]
-            else:
-                language_model = get_qwen_language_model(model)
-                lm_head = get_lm_head(model, language_model)
-                hidden_states = (
-                    reference_output.last_hidden_state
-                    if hasattr(reference_output, "last_hidden_state")
-                    else reference_output[0]
-                )
-                reference = lm_head(hidden_states[:, -1, :])
+        reference = call_vision_reference(
+            visual,
+            pixel_values,
+            processor_inputs,
+            input_contract,
+            core_inputs,
+        )
 
     use_vit_attention_plugin = not args.no_vit_attention_plugin
-    set_vit_plugin_config_from_qwen_visual(visual, pixel_values)
+    set_vit_plugin_config_from_visual(visual, pixel_values)
     vision_config = getattr(
         visual,
         "config",
@@ -1179,59 +1022,16 @@ def main() -> None:
         max_window_seq_len=max_window_seq_len,
     ).eval().to(device)
 
-    if args.component == "vision":
-        exported_program = export_vision(wrapper, pixel_values, core_inputs)
-        artifact_prefix = (
-            "qwen_vision"
-            if args.model == DEFAULT_MODEL
-            else f"{safe_model_tag(args.model)}_vision"
-        )
-        sample_inputs = {"pixel_values": pixel_values, **core_inputs}
-        compile_args = (pixel_values,)
-        compile_kwargs = core_inputs
-        tensor_input_specs = tensor_specs(sample_inputs)
-        output_metadata = {
-            "vision_embeddings_shape": list(reference.shape),
-            "vision_embeddings_dtype": str(reference.dtype),
-        }
-    else:
-        language_model = get_qwen_language_model(model)
-        embeddings = get_input_embedding_layer(model, language_model)
-        lm_head = get_lm_head(model, language_model)
-        position_ids = get_qwen_position_ids(
-            model,
-            input_ids,
-            image_grid_thw=image_grid_thw,
-            attention_mask=attention_mask,
-        )
-        full_wrapper = QwenVlmPrefillWrapper(
-            wrapper,
-            embeddings,
-            language_model,
-            lm_head,
-            get_image_token_id(model),
-        ).eval().to(device)
-        exported_program = export_vlm_prefill(
-            full_wrapper,
-            input_ids,
-            pixel_values,
-            position_ids,
-            core_inputs,
-        )
-        artifact_prefix = "qwen_vlm_prefill"
-        sample_inputs = {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-            "position_ids": position_ids,
-            **core_inputs,
-        }
-        compile_args = (input_ids, pixel_values, position_ids)
-        compile_kwargs = core_inputs
-        tensor_input_specs = tensor_specs(sample_inputs)
-        output_metadata = {
-            "last_token_logits_shape": list(reference.shape),
-            "last_token_logits_dtype": str(reference.dtype),
-        }
+    exported_program = export_vision(wrapper, pixel_values, core_inputs)
+    artifact_prefix = f"{safe_model_tag(args.model)}_vision"
+    sample_inputs = {"pixel_values": pixel_values, **core_inputs}
+    compile_args = (pixel_values,)
+    compile_kwargs = core_inputs
+    tensor_input_specs = tensor_specs(sample_inputs)
+    output_metadata = {
+        "vision_embeddings_shape": list(reference.shape),
+        "vision_embeddings_dtype": str(reference.dtype),
+    }
 
     export_path = output_dir / f"{artifact_prefix}_exported_program.pt2"
     torch.export.save(exported_program, export_path)
@@ -1264,8 +1064,6 @@ def main() -> None:
         manifest["artifacts"]["sample_tensors"] = sample_path.name
 
     if args.compile_torchtrt:
-        if args.component == "vlm_prefill":
-            maybe_register_sdpa_converter(args.model, model.config)
         trt_path = output_dir / f"{artifact_prefix}_torchtrt.pt2"
         compile_inputs = compile_inputs_from_tensors(
             compile_args,

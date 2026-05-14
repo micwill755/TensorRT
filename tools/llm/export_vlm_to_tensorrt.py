@@ -49,6 +49,7 @@ DEFAULT_OUTPUT_DIR = "/tmp/vlm_vision_tensorrt_artifacts"
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI options for export, compile, and engine replay workflows."""
     parser = argparse.ArgumentParser(
         description="Export a VLM vision tower through torch.export and Torch-TensorRT."
     )
@@ -217,6 +218,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def dtype_from_name(name: str) -> torch.dtype:
+    """Map a short CLI dtype name to the matching torch dtype."""
     return {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -225,6 +227,7 @@ def dtype_from_name(name: str) -> torch.dtype:
 
 
 def dtype_from_string(name: str) -> torch.dtype:
+    """Map manifest dtype strings back to torch dtypes."""
     normalized = name.removeprefix("torch.")
     if normalized in ("float16", "bfloat16", "float32"):
         return dtype_from_name(normalized)
@@ -237,6 +240,7 @@ def dtype_from_string(name: str) -> torch.dtype:
 
 
 def model_loader_candidates(prefer_generation_model: bool) -> List[Any]:
+    """Return generic HF AutoModel loaders in the desired fallback order."""
     generation_candidates: List[Any] = []
     for class_name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
         try:
@@ -253,6 +257,7 @@ def model_loader_candidates(prefer_generation_model: bool) -> List[Any]:
 
 
 def import_object(import_path: str) -> Any:
+    """Import an object from a dotted path such as package.module.Class."""
     module_name, _, object_name = import_path.rpartition(".")
     if not module_name or not object_name:
         raise ValueError(
@@ -266,6 +271,7 @@ def set_attn_implementation_on_config(
     config: Any,
     attn_implementation: str,
 ) -> None:
+    """Force an HF attention implementation on a config and nested configs."""
     visited: set[int] = set()
 
     def visit(value: Any) -> None:
@@ -298,12 +304,14 @@ def load_config_with_attn_implementation(
     model_name: str,
     attn_implementation: str,
 ) -> Any:
+    """Load an HF config and apply an attention override before model init."""
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     set_attn_implementation_on_config(config, attn_implementation)
     return config
 
 
 def ensure_tied_weight_keys_compat(model: nn.Module) -> None:
+    """Bridge older remote HF models to newer tied-weight loader expectations."""
     if hasattr(model, "all_tied_weights_keys"):
         return
 
@@ -318,6 +326,7 @@ def ensure_tied_weight_keys_compat(model: nn.Module) -> None:
 
 @contextmanager
 def force_attn_implementation_during_init(attn_implementation: str | None):
+    """Temporarily force nested HF model configs during PreTrainedModel init."""
     if attn_implementation is None:
         yield
         return
@@ -341,6 +350,7 @@ def force_attn_implementation_during_init(attn_implementation: str | None):
 
 @contextmanager
 def default_device_for_loading(device: str):
+    """Temporarily set torch's default device while HF constructs modules."""
     get_default_device = getattr(torch, "get_default_device", None)
     set_default_device = getattr(torch, "set_default_device", None)
     if get_default_device is None or set_default_device is None:
@@ -358,6 +368,7 @@ def default_device_for_loading(device: str):
 def enable_dataclass_kw_only_import_compat(
     module_prefixes: Tuple[str, ...],
 ) -> None:
+    """Patch dataclass imports for packages with Python 3.12 field-order issues."""
     import dataclasses
 
     if getattr(dataclasses.dataclass, "_vlm_export_kw_only_compat", False):
@@ -391,6 +402,7 @@ def enable_dataclass_kw_only_import_compat(
 
 
 def add_common_vlm_aliases(model: nn.Module) -> nn.Module:
+    """Add common .language_model and .visual aliases when a package expects them."""
     if not hasattr(model, "language_model"):
         language_model = None
         nested_model = getattr(model, "model", None)
@@ -420,6 +432,7 @@ def add_common_vlm_aliases(model: nn.Module) -> nn.Module:
 
 
 def enable_common_vlm_alias_hook() -> None:
+    """Install a process-local HF from_pretrained hook that adds VLM aliases."""
     try:
         from transformers import PreTrainedModel
     except ImportError:
@@ -454,6 +467,7 @@ def load_model(
     move_to_device: bool = True,
     attn_implementation: str | None = None,
 ) -> nn.Module:
+    """Load a VLM/policy model through HF AutoModel or a provided class path."""
     model_kwargs = {
         "trust_remote_code": True,
         "torch_dtype": dtype,
@@ -512,6 +526,7 @@ def load_model(
 
 
 def get_nested_module(model: nn.Module, module_path: str) -> nn.Module:
+    """Resolve a dotted module path inside a loaded model."""
     current: Any = model
     for attr_name in module_path.split("."):
         if not attr_name:
@@ -526,12 +541,14 @@ def get_nested_module(model: nn.Module, module_path: str) -> nn.Module:
 
 
 def get_vision_module(model: nn.Module, module_path: str | None) -> nn.Module:
+    """Return the selected vision tower, either explicit or auto-detected."""
     if module_path is not None:
         return get_nested_module(model, module_path)
     return get_generic_vision_model(model)
 
 
 def _extract_tensor(output: Any) -> torch.Tensor:
+    """Normalize common model output containers to a single tensor."""
     if hasattr(output, "pooler_output"):
         output = output.pooler_output
     if isinstance(output, (tuple, list)):
@@ -548,6 +565,7 @@ def compare_tensors(
     atol: float,
     rtol: float,
 ) -> bool:
+    """Print a compact numerical comparison between reference and actual tensors."""
     reference = reference.detach().float().cpu()
     actual = actual.detach().float().cpu()
     diff = (reference - actual).abs()
@@ -563,6 +581,7 @@ def compare_tensors(
 
 
 def _get_config_attr(config: Any, names: Tuple[str, ...]) -> Any:
+    """Return the first present config attribute from a list of aliases."""
     for name in names:
         value = getattr(config, name, None)
         if value is not None:
@@ -571,6 +590,7 @@ def _get_config_attr(config: Any, names: Tuple[str, ...]) -> Any:
 
 
 def _infer_patch_count(vision_config: Any, pixel_values: torch.Tensor) -> int:
+    """Infer the vision token count used to configure the ViT attention plugin."""
     if pixel_values.dim() in (2, 3):
         return int(pixel_values.shape[-2])
 
@@ -593,6 +613,7 @@ def _infer_patch_count(vision_config: Any, pixel_values: torch.Tensor) -> int:
 def set_vit_plugin_config_from_visual(
     visual: nn.Module, pixel_values: torch.Tensor
 ) -> None:
+    """Populate global ViT plugin metadata from the selected vision tower config."""
     vision_config = getattr(visual, "config", None)
     if vision_config is None:
         raise ValueError("Cannot infer ViT plugin config: visual.config is missing.")
@@ -624,7 +645,7 @@ def make_windowed_rope_core_inputs(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Dict[str, torch.Tensor], int]:
-    """Precompute window/RoPE tensors outside torch.export tracing."""
+    """Precompute Qwen-style window/RoPE tensors outside torch.export tracing."""
 
     with torch.no_grad():
         rotary_pos_emb = visual.rot_pos_emb(image_grid_thw)
@@ -673,6 +694,7 @@ def has_windowed_rope_contract(
     visual: nn.Module,
     inputs: Dict[str, torch.Tensor],
 ) -> bool:
+    """Detect vision towers that need grid-aware RoPE and window metadata."""
     return (
         isinstance(inputs.get("image_grid_thw"), torch.Tensor)
         and hasattr(visual, "get_window_index")
@@ -683,6 +705,7 @@ def has_windowed_rope_contract(
 
 
 def has_tiled_aspect_ratio_contract(inputs: Dict[str, torch.Tensor]) -> bool:
+    """Detect Llama-style tiled image inputs with aspect-ratio metadata."""
     return isinstance(inputs.get("aspect_ratio_ids"), torch.Tensor) and (
         isinstance(inputs.get("aspect_ratio_mask"), torch.Tensor)
         or isinstance(inputs.get("attention_mask"), torch.Tensor)
@@ -690,6 +713,7 @@ def has_tiled_aspect_ratio_contract(inputs: Dict[str, torch.Tensor]) -> bool:
 
 
 def has_grid_thw_contract(visual: nn.Module, inputs: Dict[str, torch.Tensor]) -> bool:
+    """Detect vision towers whose forward method accepts generic grid_thw."""
     if not isinstance(inputs.get("image_grid_thw"), torch.Tensor):
         return False
     try:
@@ -706,6 +730,7 @@ def prepare_vision_contract(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[str, Dict[str, torch.Tensor], int]:
+    """Choose the wrapper input contract and prepare its non-pixel tensors."""
     if has_windowed_rope_contract(visual, inputs):
         return (
             VIT_INPUT_CONTRACT_WINDOWED_ROPE,
@@ -752,6 +777,7 @@ def call_vision_reference(
     input_contract: str,
     core_inputs: Dict[str, torch.Tensor],
 ) -> torch.Tensor:
+    """Run the original vision tower once to capture a PyTorch reference output."""
     with torch.no_grad():
         if input_contract == VIT_INPUT_CONTRACT_WINDOWED_ROPE:
             return _extract_tensor(
@@ -792,6 +818,7 @@ def call_vision_reference(
 
 
 def make_synthetic_image(size: int) -> Image.Image:
+    """Create a deterministic RGB image for processor-based export samples."""
     # A deterministic, non-uniform image keeps preprocessing realistic enough
     # while avoiding network or dataset dependencies.
     y = torch.linspace(0, 255, size, dtype=torch.uint8).view(size, 1)
@@ -810,6 +837,7 @@ def prepare_processor_inputs(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    """Use an HF processor to create model-ready tensors and input metadata."""
     image = make_synthetic_image(image_size)
     messages = [
         {
@@ -859,6 +887,7 @@ def prepare_synthetic_pixel_inputs(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    """Create pixel_values directly when a model should bypass AutoProcessor."""
     y = torch.linspace(0, 1, image_size, dtype=torch.float32).view(1, image_size, 1)
     x = torch.linspace(0, 1, image_size, dtype=torch.float32).view(1, 1, image_size)
     red = x.expand(1, image_size, image_size)
@@ -882,6 +911,7 @@ def prepare_inputs(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    """Legacy helper returning pixel values and image_grid_thw from a processor."""
     inputs, metadata = prepare_processor_inputs(
         processor, prompt, image_size, device, dtype
     )
@@ -893,6 +923,7 @@ def export_vision(
     pixel_values: torch.Tensor,
     core_inputs: Dict[str, torch.Tensor],
 ) -> torch.export.ExportedProgram:
+    """Export the wrapped vision tower with a fixed tensor contract."""
     with torch.no_grad():
         return torch.export.export(
             wrapper,
@@ -905,6 +936,7 @@ def export_vision(
 def save_executorch_program(
     exported_program: torch.export.ExportedProgram, output_path: Path
 ) -> None:
+    """Optionally lower an exported program to an ExecuTorch artifact."""
     try:
         from executorch.exir import to_edge
     except ImportError as exc:
@@ -923,6 +955,7 @@ def save_sample_tensors(
     sample_inputs: Dict[str, torch.Tensor],
     reference: torch.Tensor,
 ) -> None:
+    """Save replay inputs and reference output for engine validation."""
     tensors = {
         "reference": reference.detach().cpu(),
     }
@@ -931,6 +964,7 @@ def save_sample_tensors(
 
 
 def _torch_dtype_from_trt(trt_dtype: Any) -> torch.dtype:
+    """Map TensorRT tensor dtypes to torch dtypes for runtime buffers."""
     import tensorrt as trt
 
     dtype_map = {
@@ -948,6 +982,7 @@ def _torch_dtype_from_trt(trt_dtype: Any) -> torch.dtype:
 
 
 def load_manifest(output_dir: Path) -> Dict[str, Any]:
+    """Load the export manifest from an artifact directory."""
     manifest_path = output_dir / "manifest.json"
     if not manifest_path.exists():
         raise RuntimeError(f"Could not find manifest at {manifest_path}.")
@@ -957,6 +992,7 @@ def load_manifest(output_dir: Path) -> Dict[str, Any]:
 def resolve_run_artifacts(
     args: argparse.Namespace,
 ) -> Tuple[Path, Path, str | None]:
+    """Resolve engine, sample tensor, and plugin paths for replay."""
     manifest: Dict[str, Any] | None = None
     output_dir = Path(args.output_dir)
 
@@ -998,6 +1034,7 @@ def resolve_run_artifacts(
 
 
 def run_raw_tensorrt_engine(args: argparse.Namespace) -> None:
+    """Replay a serialized TensorRT engine against saved sample tensors."""
     try:
         import tensorrt as trt
     except ImportError as exc:
@@ -1079,6 +1116,7 @@ def compile_and_save_torchtrt(
     device: torch.device,
     plugin_path: str | None,
 ) -> List[Dict[str, Any]]:
+    """Compile an ExportedProgram with Torch-TensorRT and save artifacts."""
     try:
         import torch_tensorrt
     except ImportError as exc:
@@ -1125,6 +1163,7 @@ def compile_inputs_from_tensors(
     example_inputs: Tuple[torch.Tensor, ...],
     example_kwargs: Dict[str, torch.Tensor],
 ) -> List[Any]:
+    """Create Torch-TensorRT input specs from live example tensors."""
     import torch_tensorrt
 
     return [
@@ -1137,6 +1176,7 @@ def compile_inputs_from_tensors(
 
 
 def _manifest_tensor_specs(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Collect tensor shape/dtype specs from a saved export manifest."""
     specs: Dict[str, Dict[str, Any]] = {}
     specs.update(manifest.get("tensor_inputs", {}))
     inputs = manifest.get("inputs", {})
@@ -1152,6 +1192,7 @@ def _manifest_tensor_specs(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]
 
 
 def _candidate_input_names(name: str) -> List[str]:
+    """Generate manifest key candidates for exported graph input names."""
     candidates = [name]
     if name.startswith("arg"):
         candidates.append(name[3:])
@@ -1164,6 +1205,7 @@ def compile_inputs_from_manifest(
     exported_program: torch.export.ExportedProgram,
     manifest: Dict[str, Any],
 ) -> List[Any]:
+    """Create Torch-TensorRT input specs for an existing exported program."""
     import torch_tensorrt
 
     specs = _manifest_tensor_specs(manifest)
@@ -1200,11 +1242,13 @@ def compile_inputs_from_manifest(
 
 
 def _safe_artifact_name(name: str) -> str:
+    """Convert model/module names to filesystem-safe artifact names."""
     sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip("_"))
     return sanitized or "tensorrt_engine"
 
 
 def safe_model_tag(model_name: str) -> str:
+    """Create a stable artifact prefix from an HF model id or local path."""
     return _safe_artifact_name(model_name.rsplit("/", 1)[-1].lower())
 
 
@@ -1212,6 +1256,7 @@ def save_raw_tensorrt_engines(
     trt_model: nn.Module,
     output_dir: Path,
 ) -> List[Dict[str, Any]]:
+    """Extract serialized engine bytes from a compiled Torch-TensorRT module."""
     engine_dir = output_dir / "engines"
     engine_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1244,6 +1289,7 @@ def save_raw_tensorrt_engines(
 
 
 def load_manifest_for_export(args: argparse.Namespace, export_path: Path) -> Dict[str, Any]:
+    """Find the manifest that describes an existing torch.export artifact."""
     manifest_path = (
         Path(args.input_manifest)
         if args.input_manifest is not None
@@ -1260,6 +1306,7 @@ def add_runtime_requirements(
     manifest: Dict[str, Any],
     plugin_path: str | None,
 ) -> None:
+    """Record imports and plugin load order needed to replay saved artifacts."""
     manifest["runtime_requirements"] = {
         "custom_op_module": "plugin_utils_vit",
         "tensorrt_plugin_path": plugin_path,
@@ -1273,6 +1320,7 @@ def add_runtime_requirements(
 
 
 def compile_existing_export(args: argparse.Namespace) -> None:
+    """Compile a previously saved torch.export artifact without reloading HF."""
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1311,12 +1359,14 @@ def compile_existing_export(args: argparse.Namespace) -> None:
 
 
 def write_manifest(output_dir: Path, manifest: Dict[str, Any]) -> None:
+    """Write the export manifest with stable formatting."""
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
 
 
 def tensor_specs(tensors: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, Any]]:
+    """Summarize tensor shapes and dtypes for the manifest."""
     return {
         name: {
             "shape": list(value.shape),
@@ -1327,6 +1377,7 @@ def tensor_specs(tensors: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, Any]]:
 
 
 def main() -> None:
+    """Coordinate model loading, vision export, optional compile, and manifest save."""
     args = parse_args()
     if args.run_engine is not None or args.run_bundle:
         run_raw_tensorrt_engine(args)

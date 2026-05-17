@@ -269,9 +269,30 @@ def import_object(import_path: str) -> Any:
 
 def set_attn_implementation_on_config(
     config: Any,
-    attn_implementation: str,
+    attn_implementation: str | None = None,
+    *,
+    public_attn_implementation: str | None = None,
+    internal_attn_implementation: str | None = None,
 ) -> None:
-    """Force an HF attention implementation on a config and nested configs."""
+    """Force attention implementation values on a config and nested configs.
+
+    ``attn_implementation`` is kept for the common case where the model-level
+    config field and HF's internal dispatch field should match. Wrapper models
+    can split those values so their nested backbone sees the requested attention
+    implementation while the outer HF class uses a compatible internal dispatch.
+    """
+    if attn_implementation is not None:
+        public_attn_implementation = (
+            attn_implementation
+            if public_attn_implementation is None
+            else public_attn_implementation
+        )
+        internal_attn_implementation = (
+            attn_implementation
+            if internal_attn_implementation is None
+            else internal_attn_implementation
+        )
+
     visited: set[int] = set()
 
     def visit(value: Any) -> None:
@@ -284,12 +305,11 @@ def set_attn_implementation_on_config(
         elif isinstance(value, (list, tuple)):
             children = value
         elif hasattr(value, "__dict__"):
-            for attr_name in (
-                "attn_implementation",
-                "_attn_implementation",
-                "_attn_implementation_internal",
-            ):
-                setattr(value, attr_name, attn_implementation)
+            if public_attn_implementation is not None:
+                setattr(value, "attn_implementation", public_attn_implementation)
+            if internal_attn_implementation is not None:
+                for attr_name in ("_attn_implementation", "_attn_implementation_internal"):
+                    setattr(value, attr_name, internal_attn_implementation)
             children = vars(value).values()
         else:
             return
@@ -303,9 +323,11 @@ def set_attn_implementation_on_config(
 def load_config_with_attn_implementation(
     model_name: str,
     attn_implementation: str,
+    config_loader: Any | None = None,
 ) -> Any:
     """Load an HF config and apply an attention override before model init."""
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    loader = config_loader or AutoConfig
+    config = loader.from_pretrained(model_name, trust_remote_code=True)
     set_attn_implementation_on_config(config, attn_implementation)
     return config
 
@@ -324,8 +346,102 @@ def ensure_tied_weight_keys_compat(model: nn.Module) -> None:
         model.all_tied_weights_keys = {key: None for key in tied_keys}
 
 
+def hf_model_supports_attn_implementation(
+    model: nn.Module,
+    attn_implementation: str,
+) -> bool:
+    """Return whether a HF model advertises support for an attention backend."""
+    if attn_implementation == "eager":
+        return True
+
+    support_attr = {
+        "sdpa": "_supports_sdpa",
+        "flash_attention_2": "_supports_flash_attn_2",
+        "flex_attention": "_supports_flex_attn",
+    }.get(attn_implementation)
+    if support_attr is None:
+        return True
+    return bool(getattr(model, support_attr, False))
+
+
+def select_hf_internal_attn_implementation(
+    model: nn.Module,
+    requested_attn_implementation: str,
+    unsupported_fallback: str = "eager",
+) -> str:
+    """Choose a HF internal attention dispatch for the model being initialized."""
+    if hf_model_supports_attn_implementation(model, requested_attn_implementation):
+        return requested_attn_implementation
+    return unsupported_fallback
+
+
+def install_legacy_tie_weights_compat(model: nn.Module) -> None:
+    """Allow older ``tie_weights(self)`` overrides to run on newer Transformers."""
+    if getattr(model, "_vlm_export_legacy_tie_weights_compat", False):
+        return
+
+    tie_weights = getattr(model, "tie_weights", None)
+    if tie_weights is None:
+        return
+
+    def tie_weights_compat(*args, **kwargs):
+        try:
+            return tie_weights(*args, **kwargs)
+        except TypeError as exc:
+            if "recompute_mapping" in str(exc):
+                return tie_weights()
+            raise
+
+    object.__setattr__(model, "tie_weights", tie_weights_compat)
+    object.__setattr__(model, "_vlm_export_legacy_tie_weights_compat", True)
+
+
 @contextmanager
-def force_attn_implementation_during_init(attn_implementation: str | None):
+def legacy_tie_weights_compat_during_init():
+    """Patch HF post-init so legacy custom tie_weights signatures are accepted."""
+    from transformers import PreTrainedModel
+
+    original_post_init = PreTrainedModel.post_init
+
+    def post_init_with_legacy_tie_weights(self, *args, **kwargs):
+        install_legacy_tie_weights_compat(self)
+        return original_post_init(self, *args, **kwargs)
+
+    PreTrainedModel.post_init = post_init_with_legacy_tie_weights
+    try:
+        yield
+    finally:
+        PreTrainedModel.post_init = original_post_init
+
+
+@contextmanager
+def default_torch_tensor_device_for_init(device: str):
+    """Give torch.tensor a real default device while custom modules initialize.
+
+    HF low-memory loading can construct modules while the default tensor device
+    is meta. Some custom wrappers create non-parameter constants and validate
+    them immediately, which fails for meta tensors. This context keeps those
+    constants real without changing explicit device arguments.
+    """
+    original_tensor = torch.tensor
+
+    def tensor_with_default_device(*args, **kwargs):
+        if "device" not in kwargs:
+            kwargs["device"] = device
+        return original_tensor(*args, **kwargs)
+
+    torch.tensor = tensor_with_default_device
+    try:
+        yield
+    finally:
+        torch.tensor = original_tensor
+
+
+@contextmanager
+def force_attn_implementation_during_init(
+    attn_implementation: str | None,
+    unsupported_fallback: str = "eager",
+):
     """Temporarily force nested HF model configs during PreTrainedModel init."""
     if attn_implementation is None:
         yield
@@ -336,7 +452,16 @@ def force_attn_implementation_during_init(attn_implementation: str | None):
     original_init = PreTrainedModel.__init__
 
     def init_with_forced_attn(self, config, *args, **kwargs):
-        set_attn_implementation_on_config(config, attn_implementation)
+        internal_attn_implementation = select_hf_internal_attn_implementation(
+            self,
+            attn_implementation,
+            unsupported_fallback=unsupported_fallback,
+        )
+        set_attn_implementation_on_config(
+            config,
+            public_attn_implementation=attn_implementation,
+            internal_attn_implementation=internal_attn_implementation,
+        )
         result = original_init(self, config, *args, **kwargs)
         ensure_tied_weight_keys_compat(self)
         return result
@@ -472,11 +597,6 @@ def load_model(
         "trust_remote_code": True,
         "torch_dtype": dtype,
     }
-    if attn_implementation is not None:
-        model_kwargs["config"] = load_config_with_attn_implementation(
-            model_name,
-            attn_implementation,
-        )
     if model_class is not None:
         if dataclass_kw_only_imports:
             enable_dataclass_kw_only_import_compat(
@@ -485,38 +605,58 @@ def load_model(
         if use_common_vlm_aliases:
             enable_common_vlm_alias_hook()
         loader = import_object(model_class)
+        custom_model_kwargs = dict(model_kwargs)
+        if attn_implementation is not None:
+            custom_model_kwargs["config"] = load_config_with_attn_implementation(
+                model_name,
+                attn_implementation,
+                getattr(loader, "config_class", None),
+            )
         with torch.no_grad():
             with default_device_for_loading("cpu"):
-                with force_attn_implementation_during_init(attn_implementation):
-                    if instantiate_from_config:
-                        config = loader.config_class.from_pretrained(
-                            model_name,
-                            trust_remote_code=True,
-                        )
-                        if attn_implementation is not None:
-                            set_attn_implementation_on_config(
-                                config,
-                                attn_implementation,
-                            )
-                        model = loader(config).eval()
-                    else:
-                        model = loader.from_pretrained(model_name, **model_kwargs).eval()
+                with default_torch_tensor_device_for_init("cpu"):
+                    with legacy_tie_weights_compat_during_init():
+                        with force_attn_implementation_during_init(attn_implementation):
+                            if instantiate_from_config:
+                                config = loader.config_class.from_pretrained(
+                                    model_name,
+                                    trust_remote_code=True,
+                                )
+                                if attn_implementation is not None:
+                                    set_attn_implementation_on_config(
+                                        config,
+                                        attn_implementation,
+                                    )
+                                model = loader(config).eval()
+                            else:
+                                model = loader.from_pretrained(
+                                    model_name,
+                                    **custom_model_kwargs,
+                                ).eval()
             if use_common_vlm_aliases:
                 model = add_common_vlm_aliases(model)
             return model.to(device) if move_to_device else model
 
     last_error: Exception | None = None
+    auto_model_kwargs = dict(model_kwargs)
+    if attn_implementation is not None:
+        auto_model_kwargs["config"] = load_config_with_attn_implementation(
+            model_name,
+            attn_implementation,
+        )
     with torch.no_grad():
         if use_common_vlm_aliases:
             enable_common_vlm_alias_hook()
         for loader in model_loader_candidates(prefer_generation_model):
             try:
                 with default_device_for_loading("cpu"):
-                    with force_attn_implementation_during_init(attn_implementation):
-                        model = loader.from_pretrained(
-                            model_name,
-                            **model_kwargs,
-                        ).eval()
+                    with default_torch_tensor_device_for_init("cpu"):
+                        with legacy_tie_weights_compat_during_init():
+                            with force_attn_implementation_during_init(attn_implementation):
+                                model = loader.from_pretrained(
+                                    model_name,
+                                    **auto_model_kwargs,
+                                ).eval()
                 if use_common_vlm_aliases:
                     model = add_common_vlm_aliases(model)
                 return model.to(device) if move_to_device else model
@@ -545,6 +685,49 @@ def get_vision_module(model: nn.Module, module_path: str | None) -> nn.Module:
     if module_path is not None:
         return get_nested_module(model, module_path)
     return get_generic_vision_model(model)
+
+
+def resolve_processor_candidates(model: nn.Module, model_name: str, processor_model: str | None) -> List[str]:
+    """Return processor model ids to try, ordered from most to least explicit."""
+    candidates: List[str] = []
+    for candidate in (
+        processor_model,
+        getattr(getattr(model, "config", None), "vlm_name_or_path", None),
+        getattr(getattr(model, "config", None), "processor_name_or_path", None),
+        model_name,
+    ):
+        if isinstance(candidate, str) and candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def load_processor_for_export(
+    model: nn.Module,
+    model_name: str,
+    processor_model: str | None,
+) -> Any:
+    """Load a processor for export, falling back to processors built by wrapper models."""
+    errors: List[str] = []
+    for candidate in resolve_processor_candidates(model, model_name, processor_model):
+        try:
+            return AutoProcessor.from_pretrained(
+                candidate,
+                trust_remote_code=True,
+                use_fast=True,
+            )
+        except (OSError, ValueError) as exc:
+            errors.append(f"{candidate}: {exc}")
+
+    processor = getattr(model, "processor", None)
+    if processor is not None:
+        print("Using processor attached to loaded model.")
+        return processor
+
+    joined_errors = "\n".join(errors)
+    raise ValueError(
+        "Could not load an AutoProcessor and the model has no attached processor. "
+        f"Tried:\n{joined_errors}"
+    )
 
 
 def _extract_tensor(output: Any) -> torch.Tensor:
@@ -1112,6 +1295,8 @@ def run_raw_tensorrt_engine(args: argparse.Namespace) -> None:
 def compile_and_save_torchtrt(
     exported_program: torch.export.ExportedProgram,
     compile_inputs: List[Any],
+    save_args: Tuple[torch.Tensor, ...],
+    save_kwargs: Dict[str, torch.Tensor],
     output_path: Path,
     device: torch.device,
     plugin_path: str | None,
@@ -1155,7 +1340,13 @@ def compile_and_save_torchtrt(
         min_block_size=1,
     )
     engine_entries = save_raw_tensorrt_engines(trt_model, output_path.parent)
-    torch_tensorrt.save(trt_model, str(output_path), retrace=False)
+    torch_tensorrt.save(
+        trt_model,
+        str(output_path),
+        arg_inputs=list(save_args),
+        kwarg_inputs=save_kwargs,
+        retrace=False,
+    )
     return engine_entries
 
 
@@ -1415,10 +1606,10 @@ def main() -> None:
             args.image_size, device, dtype
         )
     else:
-        processor = AutoProcessor.from_pretrained(
-            args.processor_model or args.model,
-            trust_remote_code=True,
-            use_fast=True,
+        processor = load_processor_for_export(
+            model,
+            args.model,
+            args.processor_model,
         )
         processor_inputs, input_metadata = prepare_processor_inputs(
             processor, args.prompt, args.image_size, device, dtype
@@ -1519,6 +1710,8 @@ def main() -> None:
         engine_entries = compile_and_save_torchtrt(
             exported_program,
             compile_inputs,
+            compile_args,
+            compile_kwargs,
             trt_path,
             device,
             args.plugin_path,

@@ -759,8 +759,18 @@ def _forward_tiled_aspect_ratio_vision(
 
     target_dtype = vision.patch_embedding.weight.dtype
     target_device = vision.patch_embedding.weight.device
-    patch_embeds = vision.patch_embedding(
-        pixel_values.to(target_device, target_dtype)
+    patch_input = pixel_values.to(target_device, target_dtype)
+    patch_padding = vision.patch_embedding.padding
+    if patch_padding == "valid":
+        patch_padding = (0, 0)
+    patch_embeds = torch.nn.functional.conv2d(
+        patch_input,
+        vision.patch_embedding.weight,
+        vision.patch_embedding.bias,
+        vision.patch_embedding.stride,
+        patch_padding,
+        vision.patch_embedding.dilation,
+        vision.patch_embedding.groups,
     )
     hidden_state = patch_embeds.flatten(2).transpose(1, 2)
 

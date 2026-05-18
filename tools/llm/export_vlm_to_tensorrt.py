@@ -438,6 +438,22 @@ def default_torch_tensor_device_for_init(device: str):
 
 
 @contextmanager
+def torch_save_pickle_protocol(protocol: int):
+    """Force torch.save callers in this scope to use a large-object protocol."""
+    original_save = torch.save
+
+    def save_with_protocol(*args, **kwargs):
+        kwargs.setdefault("pickle_protocol", protocol)
+        return original_save(*args, **kwargs)
+
+    torch.save = save_with_protocol
+    try:
+        yield
+    finally:
+        torch.save = original_save
+
+
+@contextmanager
 def force_attn_implementation_during_init(
     attn_implementation: str | None,
     unsupported_fallback: str = "eager",
@@ -685,6 +701,13 @@ def get_vision_module(model: nn.Module, module_path: str | None) -> nn.Module:
     if module_path is not None:
         return get_nested_module(model, module_path)
     return get_generic_vision_model(model)
+
+
+def normalize_conv2d_valid_padding(module: nn.Module) -> None:
+    """Rewrite PyTorch string padding that older Torch-TensorRT converters reject."""
+    for child in module.modules():
+        if isinstance(child, nn.Conv2d) and child.padding == "valid":
+            child.padding = (0, 0)
 
 
 def resolve_processor_candidates(model: nn.Module, model_name: str, processor_model: str | None) -> List[str]:
@@ -1340,13 +1363,14 @@ def compile_and_save_torchtrt(
         min_block_size=1,
     )
     engine_entries = save_raw_tensorrt_engines(trt_model, output_path.parent)
-    torch_tensorrt.save(
-        trt_model,
-        str(output_path),
-        arg_inputs=list(save_args),
-        kwarg_inputs=save_kwargs,
-        retrace=False,
-    )
+    with torch_save_pickle_protocol(4):
+        torch_tensorrt.save(
+            trt_model,
+            str(output_path),
+            arg_inputs=list(save_args),
+            kwarg_inputs=save_kwargs,
+            retrace=False,
+        )
     return engine_entries
 
 
@@ -1493,6 +1517,50 @@ def load_manifest_for_export(args: argparse.Namespace, export_path: Path) -> Dic
     return json.loads(manifest_path.read_text())
 
 
+def resolve_sample_tensors_path(
+    args: argparse.Namespace,
+    manifest: Dict[str, Any],
+    manifest_dir: Path,
+) -> Path:
+    """Resolve saved sample tensors for compile-only Torch-TensorRT wrapper save."""
+    if args.sample_tensors is not None:
+        return Path(args.sample_tensors)
+
+    sample_name = manifest.get("artifacts", {}).get("sample_tensors")
+    if sample_name is None:
+        raise RuntimeError(
+            "Compile-only .pt2 save requires sample tensors. Rerun export with "
+            "--save_sample_tensors or pass --sample_tensors."
+        )
+
+    sample_path = Path(sample_name)
+    if not sample_path.is_absolute():
+        sample_path = manifest_dir / sample_path
+    return sample_path
+
+
+def load_save_inputs_from_samples(
+    sample_path: Path,
+    manifest: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]:
+    """Load example inputs saved by export-only for Torch-TensorRT wrapper save."""
+    if not sample_path.exists():
+        raise RuntimeError(f"Could not find sample tensors at {sample_path}.")
+
+    samples = torch.load(sample_path, map_location="cpu")
+    if "pixel_values" not in samples:
+        raise RuntimeError(f"Sample tensor file {sample_path} is missing pixel_values.")
+
+    save_args = (samples["pixel_values"].to(device=device).contiguous(),)
+    save_kwargs: Dict[str, torch.Tensor] = {}
+    for name in manifest.get("core_inputs", {}):
+        if name in samples and isinstance(samples[name], torch.Tensor):
+            save_kwargs[name] = samples[name].to(device=device).contiguous()
+
+    return save_args, save_kwargs
+
+
 def add_runtime_requirements(
     manifest: Dict[str, Any],
     plugin_path: str | None,
@@ -1516,9 +1584,17 @@ def compile_existing_export(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     export_path = Path(args.input_export)
+    manifest_path = (
+        Path(args.input_manifest)
+        if args.input_manifest is not None
+        else export_path.parent / "manifest.json"
+    )
     manifest = load_manifest_for_export(args, export_path)
     exported_program = torch.export.load(export_path)
     compile_inputs = compile_inputs_from_manifest(exported_program, manifest)
+    device = torch.device(args.device)
+    sample_path = resolve_sample_tensors_path(args, manifest, manifest_path.parent)
+    save_args, save_kwargs = load_save_inputs_from_samples(sample_path, manifest, device)
 
     export_stem = export_path.stem
     artifact_prefix = (
@@ -1530,8 +1606,10 @@ def compile_existing_export(args: argparse.Namespace) -> None:
     engine_entries = compile_and_save_torchtrt(
         exported_program,
         compile_inputs,
+        save_args,
+        save_kwargs,
         trt_path,
-        torch.device(args.device),
+        device,
         args.plugin_path,
     )
 
@@ -1601,6 +1679,7 @@ def main() -> None:
     )
 
     visual = get_vision_module(model, args.vision_module).to(device=device, dtype=dtype).eval()
+    normalize_conv2d_valid_padding(visual)
     if args.no_processor:
         processor_inputs, input_metadata = prepare_synthetic_pixel_inputs(
             args.image_size, device, dtype

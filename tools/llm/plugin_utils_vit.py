@@ -633,6 +633,20 @@ def _forward_static_grid_thw_vision(
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
+    
+    '''
+        For Alpamayo/Qwen-style vision towers, the image is first converted into patch embeddings, 
+        passed through the ViT transformer blocks, and then sent through a final merger/projector 
+        before being used by the VLM. The tensor after the ViT blocks is only an intermediate representation, 
+        in our case [784, 1152], meaning 784 patch tokens with hidden size 1152. Alpamayo’s 
+        final vision output runs this through the merger, which combines patch groups and projects 
+        the features to [196, 4096], the embedding shape expected by the language/multimodal side. 
+        
+        Our TensorRT engine was originally returning the intermediate ViT output, while the PyTorch 
+        reference was using the final merged output, which caused the shape mismatch.
+    '''
+    if hasattr(model, "merger"):
+        hidden_states = model.merger(hidden_states)
     return hidden_states
 
 

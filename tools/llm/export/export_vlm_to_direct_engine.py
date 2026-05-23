@@ -5,7 +5,7 @@ This script is the "from model" companion to compile_vlm_export_to_engine.py:
 
     HF/PyTorch vision tower -> torch.export -> serialized TensorRT .engine
 
-It reuses export_vlm_to_tensorrt.py for Hugging Face loading, processor input
+It reuses plugin_utils_vit.py for Hugging Face loading, processor input
 preparation, vision-contract handling, and ViT attention replacement. The final
 compile step uses Torch-TensorRT's direct serialized-engine API instead of
 building a Torch-TensorRT runtime module.
@@ -16,17 +16,20 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from compile_vlm_export_to_engine import inspect_serialized_engine, relative_or_absolute
-from export_vlm_to_tensorrt import (
+from compile_vlm_export_to_engine import inspect_serialized_engine
+from utils.direct_engine_utils import (
+    add_direct_engine_manifest_fields as add_shared_direct_engine_manifest_fields,
+    compile_exported_program_to_serialized_engine,
+)
+from utils.plugin.plugin_utils_vit import (
     DEFAULT_OUTPUT_DIR,
     VIT_INPUT_CONTRACT_STATIC_GRID_THW,
     ViTPluginWrapper,
     call_vision_reference,
-    compile_inputs_from_tensors,
     count_vit_plugin_attention_modules,
     dtype_from_name,
     export_vision,
@@ -37,6 +40,7 @@ from export_vlm_to_tensorrt import (
     normalize_conv2d_valid_padding,
     prepare_processor_inputs,
     prepare_synthetic_pixel_inputs,
+    prepare_edge_llm_runtime_contract,
     prepare_vision_contract,
     replace_vit_attention_with_plugin,
     safe_model_tag,
@@ -46,7 +50,6 @@ from export_vlm_to_tensorrt import (
     tensor_specs,
     write_manifest,
 )
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -115,9 +118,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attn_implementation",
-        default=None,
+        default="eager",
         choices=("eager", "sdpa", "flash_attention_2"),
-        help="Optional Hugging Face attention implementation override.",
+        help="Hugging Face attention implementation override (default: eager).",
     )
     parser.add_argument(
         "--plugin_path",
@@ -128,6 +131,17 @@ def parse_args() -> argparse.Namespace:
         "--no_vit_attention_plugin",
         action="store_true",
         help="Use the Python fallback wrapper instead of the ViTAttentionPlugin custom op.",
+    )
+    parser.add_argument(
+        "--runtime_contract",
+        default="torchtrt",
+        choices=("torchtrt", "edgellm"),
+        help=(
+            "Tensor contract to expose in the serialized engine. 'torchtrt' "
+            "keeps the existing Python/export contract; 'edgellm' composes "
+            "a visual wrapper whose bindings match Edge-LLM runtime names when "
+            "the selected vision module exposes the required capabilities."
+        ),
     )
     parser.add_argument(
         "--save_executorch",
@@ -185,16 +199,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_trt_device(device: torch.device) -> Any:
-    import torch_tensorrt
-
-    if device.type == "cuda":
-        device_index = device.index
-        if device_index is None:
-            device_index = torch.cuda.current_device()
-        return torch_tensorrt.Device(f"cuda:{device_index}")
-    return torch_tensorrt.Device(str(device))
-
 
 def compile_direct_engine(
     exported_program: torch.export.ExportedProgram,
@@ -202,23 +206,40 @@ def compile_direct_engine(
     compile_kwargs: Dict[str, torch.Tensor],
     device: torch.device,
     args: argparse.Namespace,
+    output_names: Optional[List[str]] = None,
 ) -> bytes:
-    from torch_tensorrt.dynamo import convert_exported_program_to_serialized_trt_engine
-
-    compile_inputs = compile_inputs_from_tensors(compile_args, compile_kwargs)
+    plugin_loader = None
     if not args.no_vit_attention_plugin or args.plugin_path is not None:
-        load_plugin(args.plugin_path)
-    return convert_exported_program_to_serialized_trt_engine(
+        plugin_loader = lambda: load_plugin(args.plugin_path)
+
+    return compile_exported_program_to_serialized_engine(
         exported_program,
-        arg_inputs=compile_inputs,
-        device=resolve_trt_device(device),
+        arg_inputs=compile_args,
+        kwarg_inputs=compile_kwargs,
+        device=device,
         min_block_size=args.min_block_size,
         workspace_size=args.workspace_size,
         optimization_level=args.optimization_level,
         require_full_compilation=args.require_full_compilation,
         disable_tf32=not args.allow_tf32,
         use_fp32_acc=not args.no_fp32_acc,
+        output_names=output_names,
+        plugin_loader=plugin_loader,
     )
+
+
+def direct_compile_options(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "min_block_size": args.min_block_size,
+        "workspace_size": args.workspace_size,
+        "optimization_level": args.optimization_level,
+        "require_full_compilation": bool(args.require_full_compilation),
+        "disable_tf32": not args.allow_tf32,
+        "use_fp32_acc": not args.no_fp32_acc,
+        "use_explicit_typing": True,
+        "immutable_weights": True,
+        "truncate_double": True,
+    }
 
 
 def add_direct_engine_manifest_fields(
@@ -229,34 +250,16 @@ def add_direct_engine_manifest_fields(
     args: argparse.Namespace,
     engine_info: Dict[str, Any],
 ) -> None:
-    manifest["artifacts"]["direct_tensorrt_engine"] = relative_or_absolute(
-        engine_path,
-        output_dir,
+    add_shared_direct_engine_manifest_fields(
+        manifest,
+        engine_path=engine_path,
+        output_dir=output_dir,
+        engine_bytes=engine_bytes,
+        compile_options=direct_compile_options(args),
+        engine_info=engine_info,
+        custom_op_module="plugin_utils_vit",
+        plugin_path=args.plugin_path,
     )
-    manifest["direct_tensorrt_engine"] = {
-        "path": relative_or_absolute(engine_path, output_dir),
-        "bytes": len(engine_bytes),
-        **engine_info,
-    }
-    manifest["direct_tensorrt_compile"] = {
-        "api": "torch_tensorrt.dynamo.convert_exported_program_to_serialized_trt_engine",
-        "min_block_size": args.min_block_size,
-        "workspace_size": args.workspace_size,
-        "optimization_level": args.optimization_level,
-        "require_full_compilation": bool(args.require_full_compilation),
-        "disable_tf32": not args.allow_tf32,
-        "use_fp32_acc": not args.no_fp32_acc,
-    }
-    manifest["runtime_requirements"] = {
-        "custom_op_module": "plugin_utils_vit",
-        "tensorrt_plugin_path": args.plugin_path,
-        "load_order": [
-            "import plugin_utils_vit",
-            "ctypes.CDLL(tensorrt_plugin_path)",
-            "tensorrt.Runtime(...).deserialize_cuda_engine(engine_bytes)",
-        ],
-    }
-
 
 def main() -> None:
     args = parse_args()
@@ -333,24 +336,40 @@ def main() -> None:
         use_plugin_op=use_vit_attention_plugin,
     )
     attention_modules = count_vit_plugin_attention_modules(visual)
-    static_grid_thw = (
-        processor_inputs["image_grid_thw"]
-        if input_contract == VIT_INPUT_CONTRACT_STATIC_GRID_THW
-        else None
-    )
-    wrapper = ViTPluginWrapper(
-        visual,
-        input_contract=input_contract,
-        max_window_seq_len=max_window_seq_len,
-        static_grid_thw=static_grid_thw,
-    ).eval().to(device)
+    runtime_output_names: Optional[List[str]] = None
+    if args.runtime_contract == "edgellm":
+        runtime_contract = prepare_edge_llm_runtime_contract(
+            visual,
+            processor_inputs,
+            pixel_values,
+            device,
+            dtype,
+        )
+        input_contract = runtime_contract.name
+        core_inputs = runtime_contract.core_inputs
+        max_window_seq_len = 0
+        wrapper = runtime_contract.wrapper
+        runtime_output_names = runtime_contract.output_names
+        sample_inputs = {"input": pixel_values, **core_inputs}
+    else:
+        static_grid_thw = (
+            processor_inputs["image_grid_thw"]
+            if input_contract == VIT_INPUT_CONTRACT_STATIC_GRID_THW
+            else None
+        )
+        wrapper = ViTPluginWrapper(
+            visual,
+            input_contract=input_contract,
+            max_window_seq_len=max_window_seq_len,
+            static_grid_thw=static_grid_thw,
+        ).eval().to(device)
+        sample_inputs = {"pixel_values": pixel_values, **core_inputs}
 
     exported_program = export_vision(wrapper, pixel_values, core_inputs)
     artifact_prefix = f"{safe_model_tag(args.model)}_vision"
     export_path = output_dir / f"{artifact_prefix}_exported_program.pt2"
     torch.export.save(exported_program, export_path)
 
-    sample_inputs = {"pixel_values": pixel_values, **core_inputs}
     compile_args = (pixel_values,)
     compile_kwargs = core_inputs
     engine_path = (
@@ -366,6 +385,7 @@ def main() -> None:
         compile_kwargs,
         device,
         args,
+        output_names=runtime_output_names,
     )
     engine_path.write_bytes(engine_bytes)
 
@@ -382,6 +402,8 @@ def main() -> None:
         "component": "vision",
         "format_version": 1,
         "input_contract": input_contract,
+        "runtime_contract": args.runtime_contract,
+        "runtime_output_names": runtime_output_names,
         "model_class": args.model_class,
         "processor_model": args.processor_model,
         "vision_module": args.vision_module,

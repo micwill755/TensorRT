@@ -33,7 +33,7 @@ except ImportError:
     QUANTIZATION_AVAILABLE = False
 from torchtrt_ext import register_sdpa
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from utils import (
+from utils.utils import (
     export_llm,
     generate,
     generate_with_static_cache,
@@ -43,7 +43,7 @@ from utils import (
 
 # Import plugin utilities (optional)
 try:
-    from plugin_utils import (
+    from utils.plugin.plugin_utils import (
         LLMPluginWrapper,
         benchmark_plugin_generation,
         compile_plugin_model,

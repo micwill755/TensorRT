@@ -182,7 +182,7 @@ if not (
 
 # The converter for tensorrt_edge_llm::xqa_attn is defined in plugin_converter.py.
 # Import it here so that importing plugin_utils still registers the converter.
-from plugin_converter import convert_attn  # noqa: F401
+from .plugin_converter import convert_attn  # noqa: F401
 
 # -----------------------------------------------------------------------------
 # RoPE Cache Generation
@@ -363,16 +363,23 @@ class LLMPluginWrapper(nn.Module):
     managing KV caches and context lengths appropriately.
     """
 
-    def __init__(self, model: nn.Module, model_type: str = "auto"):
+    def __init__(
+        self,
+        model: nn.Module,
+        model_type: str = "auto",
+        lm_head: Optional[nn.Module] = None,
+    ):
         """
         Initialize the wrapper.
 
         Args:
             model: The model with replaced attention modules.
             model_type: Type of model ("qwen", "llama", or "auto" for auto-detection).
+            lm_head: Optional LM head when it lives outside the selected transformer.
         """
         super().__init__()
         self.model = model
+        self.lm_head = lm_head
         self.model_type = (
             self._detect_model_type(model) if model_type == "auto" else model_type
         )
@@ -388,20 +395,42 @@ class LLMPluginWrapper(nn.Module):
             # Default to generic transformer structure
             return "generic"
 
+    def _is_transformer_leaf(self, module: Any) -> bool:
+        return (
+            isinstance(module, nn.Module)
+            and hasattr(module, "embed_tokens")
+            and any(hasattr(module, attr) for attr in ("layers", "h", "blocks"))
+        )
+
     def _get_transformer(self) -> nn.Module:
         """Get the transformer backbone based on model type."""
-        if self.model_type == "qwen":
-            return self.model.model
-        elif self.model_type == "llama":
-            return self.model.model
-        else:
-            # Try common attribute names
-            for attr in ["model", "transformer", "backbone"]:
-                if hasattr(self.model, attr):
-                    return getattr(self.model, attr)
-            raise ValueError(
-                f"Cannot find transformer backbone for model type: {self.model_type}"
-            )
+        if self._is_transformer_leaf(self.model):
+            return self.model
+
+        if self.model_type in ("qwen", "llama") and hasattr(self.model, "model"):
+            candidate = self.model.model
+            if self._is_transformer_leaf(candidate):
+                return candidate
+            for attr in ("language_model", "text_model", "decoder"):
+                nested = getattr(candidate, attr, None)
+                if self._is_transformer_leaf(nested):
+                    return nested
+
+        for attr in (
+            "model",
+            "transformer",
+            "backbone",
+            "language_model",
+            "text_model",
+            "decoder",
+        ):
+            candidate = getattr(self.model, attr, None)
+            if self._is_transformer_leaf(candidate):
+                return candidate
+
+        raise ValueError(
+            f"Cannot find transformer backbone for model type: {self.model_type}"
+        )
 
     def _get_layers(self, transformer: nn.Module) -> nn.ModuleList:
         """Get the list of transformer layers."""
@@ -472,8 +501,12 @@ class LLMPluginWrapper(nn.Module):
         elif hasattr(transformer, "ln_f"):
             hidden_states = transformer.ln_f(hidden_states)
 
-        # LM head
-        logits = self.model.lm_head(hidden_states)
+        # LM head may live outside the selected transformer leaf in VLM stacks.
+        lm_head = self.lm_head if self.lm_head is not None else getattr(self.model, "lm_head", None)
+        if lm_head is None:
+            return hidden_states, new_kv_caches
+
+        logits = lm_head(hidden_states)
 
         return logits, new_kv_caches
 

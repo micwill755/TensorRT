@@ -41,7 +41,7 @@ from PIL import Image
 from transformers import AutoConfig, AutoModel, AutoProcessor, PreTrainedModel
 from transformers.models.qwen2 import modeling_qwen2 as mq
 from transformers.models.siglip import modeling_siglip as ms
-from utils import (
+from utils.utils import (
     export_llm,
     generate_mm,
     generate_mm_qwen2_5_vl,
@@ -54,7 +54,7 @@ from utils import (
 
 # Import ViT plugin utilities (optional)
 try:
-    from plugin_utils_vit import (
+    from utils.plugin.plugin_utils_vit import (
         ViTPluginAttention,
         ViTPluginWrapper,
         VIT_INPUT_CONTRACT_NATIVE,

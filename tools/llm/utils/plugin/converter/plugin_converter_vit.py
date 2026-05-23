@@ -8,7 +8,7 @@ custom op. It is kept in a separate file from plugin_utils.py for maintainabilit
 import numpy as np
 import tensorrt as trt
 
-from plugin_utils_vit import get_vit_plugin_config, register_vit_plugin_op
+from .plugin_utils_vit import get_vit_plugin_config, register_vit_plugin_op
 from torch_tensorrt.dynamo.conversion import (
     ConversionContext,
     dynamo_tensorrt_converter,

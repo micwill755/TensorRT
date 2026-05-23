@@ -20,7 +20,7 @@ from contextlib import nullcontext
 import torch
 import torch_tensorrt
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from utils import generate
+from utils.utils import generate
 
 DEVICE = torch.device("cuda:0")
 

@@ -34,7 +34,12 @@ from tools.edgellm.eager_export.roles import resolve_roles
 
 @dataclass(frozen=True)
 class EdgeExportOptions:
-    """Runtime options for exporting Edge roles from a manifest."""
+    """Runtime options for exporting Edge roles from a manifest.
+
+    These are command-time choices, not model description. The
+    manifest says what can be exported; options say which roles to
+    run now and whether to capture, compile, or only dry-run.
+    """
 
     selected_roles: Optional[Sequence[str]] = None
     output_root: Optional[str] = None
@@ -48,7 +53,12 @@ class EdgeExportOptions:
 
 @dataclass(frozen=True)
 class EdgeRoleExportResult:
-    """Artifacts emitted for one role."""
+    """Artifacts emitted for one role.
+
+    Keeping results structured makes it easy for a CLI, test, or
+    future orchestration layer to report where each generated file
+    landed.
+    """
 
     name: str
     component: str
@@ -63,6 +73,11 @@ class EdgeRoleExportResult:
 
 
 def _role_should_compile(role_compile: Optional[bool], global_compile: bool) -> bool:
+    """Decide whether this role should compile to a TensorRT engine.
+
+    A role can override the global CLI flag. ``None`` means "inherit
+    the command-line default".
+    """
     if role_compile is None:
         return global_compile
     return bool(role_compile)
@@ -78,6 +93,12 @@ def _compile_role_torchtrt(
     output_names: list[str],
     dynamic_axes: Dict[str, Dict[int, str]],
 ) -> None:
+    """Compile an eager ``nn.Module`` using the existing ONNX helper.
+
+    This path is intentionally conservative: it supports positional
+    example inputs and delegates TensorRT plugin naming/profile work
+    to Edge-LLM's current ``export_onnx`` helper.
+    """
     if examples.kwargs:
         raise ValueError(
             "Torch-TRT compile through the generic Edge exporter currently "
@@ -105,6 +126,12 @@ def _compile_exported_program_torchtrt(
     input_names: list[str],
     output_names: list[str],
 ) -> None:
+    """Compile a previously saved ``ExportedProgram`` to TensorRT.
+
+    This is the ExportedProgram-first path: the graph has already been
+    captured by PyTorch export, and this function turns it into a
+    serialized TensorRT engine with stable input/output names.
+    """
     if not examples.args and not examples.kwargs:
         raise ValueError(
             "Compiling an existing ExportedProgram requires example_inputs so "
@@ -153,18 +180,33 @@ def _compile_exported_program_torchtrt(
 
 
 class EdgeExport:
-    """Export Edge runtime artifacts from an eager-style role manifest."""
+    """Export Edge runtime artifacts from an eager-style role manifest.
+
+    ``EdgeExport`` is the shared core used by both front doors:
+    direct eager manifests and Hugging Face strategies that generate
+    a manifest. It owns the common lifecycle: load model, resolve
+    roles, create example inputs, capture/compile, write contracts,
+    call packagers, and write summaries.
+    """
 
     def __init__(self, manifest: EagerExportManifest, *, manifest_path: Optional[str | Path] = None):
+        """Store the parsed manifest and its source path, if known."""
         self.manifest = manifest
         self.manifest_path = Path(manifest_path).expanduser().resolve() if manifest_path else None
 
     @classmethod
     def from_manifest_path(cls, manifest_path: str | Path) -> "EdgeExport":
+        """Load a manifest from JSON and create an exporter."""
         path = Path(manifest_path).expanduser().resolve()
         return cls(load_manifest(path), manifest_path=path)
 
     def run(self, options: Optional[EdgeExportOptions] = None) -> dict[str, EdgeRoleExportResult]:
+        """Run the full export lifecycle for selected roles.
+
+        The same function handles dry-run, capture-only, compile-only,
+        and capture+compile flows. Each role is processed independently
+        so a manifest can grow from one component to many over time.
+        """
         options = options or EdgeExportOptions()
         loaded = load_eager_model(
             self.manifest,
@@ -173,6 +215,8 @@ class EdgeExport:
             dtype=options.dtype,
         )
         selected = list(options.selected_roles) if options.selected_roles is not None else None
+        # Convert manifest role names like "action" into concrete
+        # Python modules or ExportedProgram paths.
         resolved_roles = resolve_roles(
             loaded.model,
             self.manifest,
@@ -222,6 +266,8 @@ class EdgeExport:
                 )
             output_dir.mkdir(parents=True, exist_ok=True)
 
+            # Example inputs define the graph signature that Torch export
+            # and Torch-TensorRT will see. They are not real runtime data.
             examples = resolve_role_examples(
                 self.manifest,
                 role,
@@ -282,6 +328,8 @@ class EdgeExport:
                         dynamic_axes=dynamic_axes,
                     )
 
+            # Contracts are the semantic ABI consumed by generic Edge
+            # runners; they explain what engine tensors mean.
             contract_path = write_role_contract_manifest(
                 output_dir,
                 role,

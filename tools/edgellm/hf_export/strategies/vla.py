@@ -18,6 +18,13 @@ _ACTION_WRAPPER_SYMBOLS = None
 
 
 def _action_wrapper_symbols():
+    """Lazy-load Edge-LLM action wrapper classes.
+
+    Importing the full Edge-LLM model package can pull in heavy
+    optional dependencies. Delaying this import lets ``--help`` and
+    family detection work even on systems that are not ready to run
+    action export.
+    """
     global _ACTION_WRAPPER_SYMBOLS
     if _ACTION_WRAPPER_SYMBOLS is None:
         from tensorrt_edgellm.action_models.gr00t_model import (
@@ -45,6 +52,7 @@ from .base import EdgeHFStrategy, HFExportConfig
 
 
 def _torch_dtype(dtype: Optional[str]) -> torch.dtype:
+    """Translate CLI dtype strings into ``torch.dtype`` objects."""
     if dtype in (None, "fp16", "float16", "half"):
         return torch.float16
     if dtype in ("bf16", "bfloat16"):
@@ -55,6 +63,12 @@ def _torch_dtype(dtype: Optional[str]) -> torch.dtype:
 
 
 def _filter_supported_kwargs(fn: Any, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop keyword arguments that a loader does not accept.
+
+    Custom Hugging Face policy classes are not perfectly consistent
+    about their ``from_pretrained`` signatures. Filtering keeps the
+    generic exporter tolerant without hard-coding each class.
+    """
     import inspect
 
     try:
@@ -67,6 +81,12 @@ def _filter_supported_kwargs(fn: Any, kwargs: Mapping[str, Any]) -> dict[str, An
 
 
 def _set_attn_implementation(config: Any, attn_implementation: Optional[str]) -> None:
+    """Best-effort set attention implementation on nested configs.
+
+    Many HF configs nest language and vision configs. We recursively
+    set both public and private attention fields where they exist,
+    and ignore objects that do not expose those fields.
+    """
     if config is None or attn_implementation is None:
         return
     for attr_name in ("attn_implementation", "_attn_implementation"):
@@ -90,6 +110,11 @@ def _load_with_class(
     attn_implementation: Optional[str],
     extra_kwargs: Mapping[str, Any],
 ) -> nn.Module:
+    """Load a custom VLA class from ``--model_class``.
+
+    This is the path used for LeRobot/OpenPI-style policies whose
+    root config is not a standard Transformers model type.
+    """
     loader = import_object(model_class)
     load_kwargs = {
         "torch_dtype": torch_dtype,
@@ -128,6 +153,12 @@ def _load_auto_vla(
     torch_dtype: torch.dtype,
     trust_remote_code: bool,
 ) -> tuple[nn.Module, Any, Any]:
+    """Try generic HF Auto classes for VLA-like repos.
+
+    This is a convenience path for models that are already compatible
+    with Transformers auto loading. If it fails, users should provide
+    ``--model_class`` so the exporter can call the repo-specific class.
+    """
     processor = None
     try:
         from transformers import AutoProcessor
@@ -158,6 +189,11 @@ def _load_auto_vla(
 
 
 def _maybe_to_device(model: nn.Module, *, device: str, torch_dtype: torch.dtype) -> nn.Module:
+    """Move a model to the requested device and dtype.
+
+    Some modules accept ``to(device=..., dtype=...)`` while others
+    only accept a device first. This helper handles both styles.
+    """
     try:
         return model.to(device=device, dtype=torch_dtype)
     except TypeError:
@@ -166,6 +202,11 @@ def _maybe_to_device(model: nn.Module, *, device: str, torch_dtype: torch.dtype)
 
 
 def _supports_prefix_kv_flow_step(model: nn.Module) -> bool:
+    """Detect PI0.5/OpenPI-style prefix-KV action structure.
+
+    This is structural detection: we look for capabilities the wrapper
+    needs, not for a particular model id.
+    """
     core = getattr(model, "model", model)
     return all(
         hasattr(core, attr)
@@ -174,6 +215,7 @@ def _supports_prefix_kv_flow_step(model: nn.Module) -> bool:
 
 
 def _supports_state_conditioned_flow_step(model: nn.Module) -> bool:
+    """Detect GR00T-style state-conditioned action structure."""
     action_head = getattr(model, "action_head", None)
     return action_head is not None and all(
         hasattr(action_head, attr)
@@ -189,6 +231,12 @@ def _supports_state_conditioned_flow_step(model: nn.Module) -> bool:
 
 
 def _wrap_action_role(model: nn.Module) -> tuple[str, nn.Module]:
+    """Choose the action contract and wrapper for a loaded VLA model.
+
+    The loaded root model is usually too large and irregular to export
+    directly. The wrapper exposes one clean forward signature matching
+    a runtime contract.
+    """
     (
         PI05PrefixKVActionStep,
         GR00TStateFlowActionStep,
@@ -215,7 +263,12 @@ def load_vla_model(
     trust_remote_code: bool = True,
     **from_pretrained_kwargs: Any,
 ) -> LoadedEagerModel:
-    """Load a VLA eager model and expose structural Edge roles."""
+    """Load a VLA eager model and expose structural Edge roles.
+
+    The returned ``LoadedEagerModel`` uses a mapping as its model:
+    ``root`` keeps the original HF policy and ``action`` is the small
+    wrapper module that the action role will export.
+    """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch_dtype = _torch_dtype(dtype)
     tokenizer = None
@@ -265,6 +318,12 @@ def _prefix_kv_action_inputs(
     max_kv_cache_capacity: int,
     prefix_len: Optional[int],
 ) -> dict[str, Any]:
+    """Build example tensors for a prefix-KV action flow step.
+
+    These tensors describe the graph signature. They are not used as
+    real robot actions; they simply tell Torch export the batch size,
+    action dimensions, prefix KV cache layout, and dtype.
+    """
     cfg = module.core.config
     expert_cfg = module.core.paligemma_with_expert.gemma_expert.model.config
     prefix_len = int(prefix_len or min(int(max_kv_cache_capacity), 256))
@@ -311,6 +370,12 @@ def _state_conditioned_action_inputs(
     batch_size: int,
     backbone_seq_len: Optional[int],
 ) -> dict[str, Any]:
+    """Build example tensors for a state-conditioned action flow step.
+
+    The GR00T-style action engine consumes noisy actions plus VLM
+    backbone features, attention masks, robot state, embodiment id,
+    and image mask.
+    """
     cfg = module.config
     action_horizon = int(cfg.action_horizon)
     action_dim = int(cfg.max_action_dim)
@@ -362,7 +427,12 @@ def vla_action_inputs(
     backbone_seq_len: Optional[int] = None,
     **_: Any,
 ) -> dict[str, Any]:
-    """Return example inputs for the discovered VLA action contract."""
+    """Return example inputs for the discovered VLA action contract.
+
+    ``EdgeExport`` calls this hook after resolving the ``action`` role.
+    The hook dispatches to the right example builder based on the
+    wrapper module type.
+    """
     PI05PrefixKVActionStep, GR00TStateFlowActionStep, _ = _action_wrapper_symbols()
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch_dtype = _torch_dtype(dtype)
@@ -392,6 +462,12 @@ def _prefix_runtime_metadata(
     max_kv_cache_capacity: int,
     torch_dtype: torch.dtype,
 ) -> dict[str, Any]:
+    """Collect runtime metadata for prefix-KV diffusion execution.
+
+    The C++ action runner needs values such as denoise steps, action
+    chunk size, head layout, and max KV capacity. The engine alone
+    does not reliably encode all of that semantic information.
+    """
     cfg = module.core.config
     expert_cfg = module.core.paligemma_with_expert.gemma_expert.model.config
     head_dim = int(getattr(expert_cfg, "head_dim", expert_cfg.hidden_size // expert_cfg.num_attention_heads))
@@ -412,6 +488,7 @@ def _prefix_runtime_metadata(
 
 
 def _state_runtime_metadata(module: GR00TStateFlowActionStep, *, torch_dtype: torch.dtype) -> dict[str, Any]:
+    """Collect runtime metadata for state-conditioned diffusion."""
     cfg = module.config
     return {
         "wrapper": type(module).__name__,
@@ -442,7 +519,12 @@ def package_vla_action(
     dtype: Optional[str] = None,
     **_: Any,
 ) -> dict[str, Any]:
-    """Write the action contract discovered from the VLA action module."""
+    """Write the action contract discovered from the VLA action module.
+
+    This packager runs after capture/compile. It writes the
+    ``action_contract.json`` file with both the stable contract name
+    and model-derived runtime metadata.
+    """
     PI05PrefixKVActionStep, GR00TStateFlowActionStep, _ = _action_wrapper_symbols()
     torch_dtype = _torch_dtype(dtype)
     if examples is not None and getattr(examples, "args", None):
@@ -485,9 +567,15 @@ def package_vla_action(
 
 
 class VLAEdgeStrategy(EdgeHFStrategy):
-    """Build an eager-export manifest for VLA model roles."""
+    """Build an eager-export manifest for VLA model roles.
+
+    Today this strategy emits the action role first. Language and
+    visual roles still delegate to existing component exporters until
+    those paths are folded into strategy-generated manifests too.
+    """
 
     def build_manifest(self) -> dict:
+        """Return a manifest that exports the discovered VLA action role."""
         roles = set(self.cfg.roles or ("action",))
         unsupported = roles - {"action"}
         if unsupported:

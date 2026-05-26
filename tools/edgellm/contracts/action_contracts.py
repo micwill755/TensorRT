@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Named action runtime contracts for Edge-LLM exports."""
+"""Named action runtime contracts for Edge-LLM exports.
+
+Action contracts describe how the Edge runtime should call an
+action engine. They are named by runtime mechanics, not model id,
+so multiple checkpoints can share one generic runner path.
+"""
 
 from __future__ import annotations
 
@@ -29,7 +34,12 @@ ACTION_CONTRACT_GR00T_STATE_FLOW_STEP = ACTION_CONTRACT_STATE_CONDITIONED_FLOW_S
 
 @dataclass(frozen=True)
 class ActionRuntimeContract:
-    """Stable tensor contract family for an action engine export."""
+    """Stable tensor contract family for an action engine export.
+
+    For action models, the contract also implies how the runner loops
+    around the engine, such as a single flow-matching diffusion step
+    that is called repeatedly by C++.
+    """
 
     name: str
     input_names: Tuple[str, ...]
@@ -39,6 +49,7 @@ class ActionRuntimeContract:
     runtime_contract: str = "edgellm"
 
     def as_component_contract(self) -> ComponentContract:
+        """Convert the action-specific contract to the common schema."""
         return ComponentContract(
             component=COMPONENT_ACTION,
             name=self.name,
@@ -50,6 +61,7 @@ class ActionRuntimeContract:
         )
 
     def to_manifest_dict(self) -> Dict[str, Any]:
+        """Serialize this action contract for JSON output."""
         return self.as_component_contract().to_manifest_dict()
 
 
@@ -61,7 +73,12 @@ def register_action_runtime_contract(
     *,
     replace: bool = False,
 ) -> ActionRuntimeContract:
-    """Register an action runtime contract by name."""
+    """Register an action runtime contract by name.
+
+    Registration happens at import time for built-in contracts.
+    ``replace`` is only for deliberate overrides in tests or future
+    extension points.
+    """
     if not replace and contract.name in _ACTION_RUNTIME_CONTRACTS:
         raise ValueError(f"Action contract already registered: {contract.name}")
     _ACTION_RUNTIME_CONTRACTS[contract.name] = contract
@@ -97,7 +114,12 @@ def write_action_contract_manifest(
     artifacts: Optional[Mapping[str, Any]] = None,
     filename: str = ACTION_CONTRACT_MANIFEST_FILENAME,
 ) -> Path:
-    """Write action contract metadata beside an exported action artifact."""
+    """Write action contract metadata beside an exported action artifact.
+
+    The output file is consumed by C++ ``GenericActionRunner`` to
+    understand tensor names, dynamic axes, diffusion settings, and
+    related artifacts.
+    """
     contract = get_action_runtime_contract(contract_name)
     return write_component_contract_manifest(
         output_dir,
@@ -114,6 +136,12 @@ def write_action_contract_manifest(
 
 
 def _register_builtin_contracts() -> None:
+    """Install the action contracts known to this exporter.
+
+    These are runtime contract families. They intentionally avoid
+    saying "PI0.5" or "GR00T" in the contract name unless kept as
+    backward-compatible aliases.
+    """
     register_action_runtime_contract(
         ActionRuntimeContract(
             name=ACTION_CONTRACT_ALPAMAYO_FLOW_STEP,

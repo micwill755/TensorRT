@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Lightweight family detection for direct Hugging Face Edge exports."""
+"""Lightweight family detection for direct Hugging Face Edge exports.
+
+Detection is deliberately coarse. It chooses a strategy family such
+as LLM, VLM, or VLA; detailed model mechanics are discovered later
+by the strategy and contracts.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +17,12 @@ _FAMILIES = {"llm", "vlm", "vla"}
 
 
 def _config_dict(model: str) -> dict[str, Any]:
+    """Best-effort load of a Hugging Face config as a dictionary.
+
+    Some repos use normal AutoConfig, while custom repos may only
+    work through ``PretrainedConfig.get_config_dict``. If both fail
+    we return an empty dict and fall back to model-name heuristics.
+    """
     try:
         from transformers import AutoConfig
 
@@ -30,11 +41,11 @@ def _config_dict(model: str) -> dict[str, Any]:
 
 
 def detect_family(model: str, *, task_override: Optional[str] = None) -> str:
-    """Detect a coarse HF family: llm, vlm, or vla.
+    """Detect a coarse HF family: ``llm``, ``vlm``, or ``vla``.
 
-    This intentionally mirrors the run_hf.py shape: broad family selection first,
-    then strategy-specific structural detection later. It is not a model-id
-    switchboard.
+    This intentionally mirrors the ``run_hf.py`` shape: choose a
+    broad family first, then let a family strategy inspect the model
+    structure. It is not meant to be a fragile model-id switchboard.
     """
     if task_override:
         task = task_override.strip().lower().replace("_", "-")

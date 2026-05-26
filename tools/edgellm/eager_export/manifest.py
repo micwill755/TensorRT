@@ -18,6 +18,13 @@ _ROLE_COMPONENTS = {"language", "visual", "action"}
 
 
 def _as_dict(value: Any, field_name: str) -> Dict[str, Any]:
+    """Validate a JSON manifest field that should be an object.
+
+    Manifests are user-authored JSON. This helper turns missing
+    fields into an empty dict and raises a targeted error when the
+    user passes the wrong shape. That makes failures point at the
+    manifest field, not at some later internal AttributeError.
+    """
     if value is None:
         return {}
     if isinstance(value, Mapping):
@@ -26,6 +33,12 @@ def _as_dict(value: Any, field_name: str) -> Dict[str, Any]:
 
 
 def _as_list(value: Any, field_name: str) -> List[str]:
+    """Normalize a manifest field that names one or more strings.
+
+    The CLI and JSON files often accept either ``"a,b"`` or
+    ``["a", "b"]``. Internally we keep one representation: a list
+    of strings.
+    """
     if value is None:
         return []
     if isinstance(value, str):
@@ -36,6 +49,12 @@ def _as_list(value: Any, field_name: str) -> List[str]:
 
 
 def _normalize_axis_map(value: Any) -> Dict[str, Dict[int, str]]:
+    """Convert JSON dynamic-axis metadata into Python-friendly keys.
+
+    JSON object keys are always strings, but Torch/TensorRT axis
+    indices are integers. This converts ``{"input": {"0":
+    "batch"}}`` into ``{"input": {0: "batch"}}``.
+    """
     result: Dict[str, Dict[int, str]] = {}
     for tensor_name, axes in _as_dict(value, "dynamic_axes").items():
         result[str(tensor_name)] = {
@@ -47,7 +66,14 @@ def _normalize_axis_map(value: Any) -> Dict[str, Dict[int, str]]:
 
 @dataclass(frozen=True)
 class EagerExportRole:
-    """One model component to capture or compile from an eager root model."""
+    """One model component to capture or compile from an eager root model.
+
+    A role is the bridge between a Python model and an Edge runtime
+    component. For example, one eager policy model may expose an
+    ``action`` role whose module path points at an action-head
+    wrapper, plus metadata describing its example inputs, output
+    names, runtime contract, and destination directory.
+    """
 
     name: str
     component: str
@@ -68,6 +94,13 @@ class EagerExportRole:
 
     @staticmethod
     def from_manifest(name: str, value: Any) -> "EagerExportRole":
+        """Parse one ``roles.<name>`` block from a manifest.
+
+        The compact form ``"action": "model.action_head"`` is
+        expanded into the same structure as the verbose object form.
+        Validation happens here so the exporter can use typed
+        dataclasses afterward.
+        """
         if isinstance(value, str):
             data = {"module": value}
         else:
@@ -110,6 +143,12 @@ class EagerExportRole:
         )
 
     def default_engine_filename(self) -> str:
+        """Return the conventional engine filename for this role.
+
+        Runtime code expects stable names such as ``llm.engine``,
+        ``visual.engine``, and ``action.engine``. Custom roles fall
+        back to ``<role-name>.engine``.
+        """
         if self.engine_filename:
             return self.engine_filename
         if self.component == "language":
@@ -123,7 +162,13 @@ class EagerExportRole:
 
 @dataclass(frozen=True)
 class EagerExportManifest:
-    """Top-level eager export manifest."""
+    """Top-level eager export manifest.
+
+    The manifest says how to load an already-working eager model,
+    which roles to extract from it, and where to place exported
+    artifacts. It intentionally does not encode model-family logic;
+    that belongs in HF strategies.
+    """
 
     loader: Optional[str] = None
     loader_kwargs: Mapping[str, Any] = field(default_factory=dict)
@@ -135,6 +180,7 @@ class EagerExportManifest:
 
     @staticmethod
     def from_dict(data: Mapping[str, Any]) -> "EagerExportManifest":
+        """Validate raw JSON data and convert it into a manifest."""
         raw = dict(data)
         loader = raw.get("loader")
 
@@ -160,7 +206,11 @@ class EagerExportManifest:
 
 
 def load_manifest(path: str | Path) -> EagerExportManifest:
-    """Load and validate an eager export manifest JSON file."""
+    """Load and validate an eager export manifest JSON file.
+
+    This is the main entry point used by
+    ``EdgeExport.from_manifest_path``.
+    """
     manifest_path = Path(path).expanduser().resolve()
     with manifest_path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)

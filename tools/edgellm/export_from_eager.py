@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Export already-running eager PyTorch model components.
 
-This is the Naren-style front door: the user owns Hugging Face/custom loading
+This is the eager-model export path: the user owns Hugging Face/custom loading
 and proves the model runs in eager mode. Edge-LLM then captures selected roles
 and emits artifacts that can target the existing generic runtimes.
 """
@@ -22,6 +22,10 @@ from tools.edgellm.edge_export import EdgeExport, EdgeExportOptions
 
 
 def _split_roles(values: Optional[list[str]]) -> Optional[list[str]]:
+    """Normalize repeated/comma-separated ``--role`` flags.
+
+    Returning ``None`` means "use every role in the manifest".
+    """
     if not values:
         return None
     roles: list[str] = []
@@ -31,6 +35,12 @@ def _split_roles(values: Optional[list[str]]) -> Optional[list[str]]:
 
 
 def main() -> None:
+    """Parse CLI flags and run the eager-manifest export path.
+
+    This command starts after the user has solved model loading. The
+    manifest points at a loader or ExportedProgram plus the runtime
+    roles to export.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Capture or compile Edge-LLM components from a user-provided eager "

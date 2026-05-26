@@ -23,7 +23,12 @@ COMPONENT_ACTION = "action"
 
 @dataclass(frozen=True)
 class ComponentContract:
-    """Stable tensor contract for one exported model component."""
+    """Stable tensor contract for one exported model component.
+
+    A component contract is the semantic ABI between the exporter
+    and the C++ runtime. TensorRT can tell us tensor names and
+    shapes, but this object records what those tensors mean.
+    """
 
     component: str
     name: str
@@ -36,6 +41,7 @@ class ComponentContract:
     output_bindings: Tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
 
     def to_manifest_dict(self) -> Dict[str, Any]:
+        """Serialize the registered contract into JSON-ready data."""
         return {
             "component": self.component,
             "name": self.name,
@@ -56,7 +62,11 @@ class ComponentContract:
 def json_dynamic_axes(
     dynamic_axes: Optional[Mapping[str, Mapping[int, str]]],
 ) -> Dict[str, Dict[str, str]]:
-    """Return JSON-friendly dynamic axes with stringified axis indices."""
+    """Return JSON-friendly dynamic axes with stringified indices.
+
+    Python uses integer axis keys. JSON object keys are strings, so
+    manifests store ``0`` as ``"0"``.
+    """
     return {
         name: {str(axis): axis_name for axis, axis_name in axes.items()}
         for name, axes in (dynamic_axes or {}).items()
@@ -64,7 +74,11 @@ def json_dynamic_axes(
 
 
 def metadata_without_none(metadata: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Drop unset metadata values before writing manifests."""
+    """Drop unset metadata values before writing manifests.
+
+    This keeps contract files readable and avoids implying that
+    ``null`` fields carry runtime meaning.
+    """
     return {
         key: value
         for key, value in (metadata or {}).items()
@@ -75,6 +89,7 @@ def metadata_without_none(metadata: Optional[Mapping[str, Any]]) -> Dict[str, An
 def _binding_by_name(
     bindings: Optional[Tuple[Mapping[str, Any], ...] | List[Mapping[str, Any]]],
 ) -> Dict[str, Dict[str, Any]]:
+    """Index optional binding metadata by TensorRT tensor name."""
     return {
         str(binding["name"]): dict(binding)
         for binding in (bindings or [])
@@ -83,6 +98,7 @@ def _binding_by_name(
 
 
 def _default_input_binding(name: str) -> Dict[str, Any]:
+    """Create the default runtime binding for an input tensor."""
     return {
         "name": name,
         "source": name,
@@ -91,6 +107,7 @@ def _default_input_binding(name: str) -> Dict[str, Any]:
 
 
 def _default_output_binding(name: str) -> Dict[str, Any]:
+    """Create the default runtime binding for an output tensor."""
     return {
         "name": name,
         "semantic": name,
@@ -147,7 +164,12 @@ def build_component_contract_manifest(
     input_bindings: Optional[List[Mapping[str, Any]]] = None,
     output_bindings: Optional[List[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Build the common manifest shape for an exported component."""
+    """Build the common manifest shape for an exported component.
+
+    The manifest stores three layers of information: the named
+    contract, the concrete engine I/O names from this export, and
+    optional artifacts/metadata that help runtime and debugging.
+    """
     resolved_input_names = list(input_names or contract.input_names)
     resolved_output_names = list(output_names or contract.output_names)
     manifest: Dict[str, Any] = {
@@ -191,7 +213,11 @@ def write_component_contract_manifest(
     input_bindings: Optional[List[Mapping[str, Any]]] = None,
     output_bindings: Optional[List[Mapping[str, Any]]] = None,
 ) -> Path:
-    """Write a component contract manifest with stable formatting."""
+    """Write a component contract manifest with stable formatting.
+
+    Stable indentation and sorted keys make generated manifests easy
+    to diff when export behavior changes.
+    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     manifest = build_component_contract_manifest(

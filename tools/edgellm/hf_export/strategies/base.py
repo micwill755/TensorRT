@@ -11,6 +11,12 @@ from typing import Any, Mapping, Optional, Sequence
 
 @dataclass(frozen=True)
 class HFExportConfig:
+    """Common configuration passed from the HF CLI into a strategy.
+
+    The CLI parses many flags, but each family strategy should see
+    one stable object. Strategies can then build eager manifests
+    without depending directly on argparse.
+    """
     model: str
     family: str
     roles: Sequence[str]
@@ -26,11 +32,21 @@ class HFExportConfig:
 
 
 class EdgeHFStrategy(abc.ABC):
-    """A family-level strategy that emits an eager-export manifest."""
+    """A family-level strategy that emits an eager-export manifest.
+
+    A strategy owns family-specific discovery. For example, the VLA
+    strategy decides whether an eager model looks like PI0.5-style
+    prefix-KV action export or GR00T-style state-conditioned export.
+    """
 
     def __init__(self, cfg: HFExportConfig):
+        """Store the normalized configuration for this family strategy."""
         self.cfg = cfg
 
     @abc.abstractmethod
     def build_manifest(self) -> dict:
-        """Return an eager-export manifest dictionary."""
+        """Return an eager-export manifest dictionary.
+
+        The returned manifest is then consumed by ``EdgeExport`` just
+        like a user-authored eager manifest.
+        """

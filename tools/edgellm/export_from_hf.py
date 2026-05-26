@@ -26,6 +26,11 @@ from tools.edgellm.hf_export.strategies.vla import VLAEdgeStrategy
 
 
 def _split_roles(values: Optional[list[str]]) -> tuple[str, ...]:
+    """Normalize repeated/comma-separated ``--role`` flags.
+
+    Direct HF export defaults to the action role because that is the
+    first role implemented through the strategy-to-manifest path.
+    """
     if not values:
         return ("action",)
     roles: list[str] = []
@@ -35,12 +40,19 @@ def _split_roles(values: Optional[list[str]]) -> tuple[str, ...]:
 
 
 def _ordered_roles(roles: tuple[str, ...]) -> tuple[str, ...]:
+    """Run roles in dependency-friendly order.
+
+    Language and visual engines usually feed action runtime behavior,
+    so we keep the order language -> visual -> action when multiple
+    roles are requested.
+    """
     ordered = [role for role in ("language", "visual", "action") if role in roles]
     ordered.extend(role for role in roles if role not in ordered)
     return tuple(ordered)
 
 
 def _build_strategy(family: str, cfg: HFExportConfig):
+    """Create the HF family strategy for roles that use manifests."""
     if family == "vla":
         return VLAEdgeStrategy(cfg)
     raise NotImplementedError(
@@ -51,6 +63,7 @@ def _build_strategy(family: str, cfg: HFExportConfig):
 
 
 def _role_output_dir(args: argparse.Namespace, role: str) -> str:
+    """Resolve the output directory for a direct component exporter."""
     explicit = {
         "language": args.llm_output_dir,
         "visual": args.visual_output_dir,
@@ -68,6 +81,11 @@ def _role_output_dir(args: argparse.Namespace, role: str) -> str:
 
 
 def _default_manifest_path(args: argparse.Namespace) -> Path:
+    """Choose where to write the generated eager manifest.
+
+    HF strategies produce manifests under the hood. Writing them to
+    disk makes the generated plan inspectable and reusable.
+    """
     if args.manifest_output:
         return Path(args.manifest_output).expanduser().resolve()
     if args.output_root:
@@ -78,6 +96,7 @@ def _default_manifest_path(args: argparse.Namespace) -> Path:
 
 
 def _export_language_role(args: argparse.Namespace, source: HFModelSource) -> None:
+    """Delegate the language role to the existing Edge-LLM LLM exporter."""
     from tensorrt_edgellm.onnx_export.llm_export import export_llm_model
 
     output_dir = _role_output_dir(args, "language")
@@ -95,6 +114,7 @@ def _export_language_role(args: argparse.Namespace, source: HFModelSource) -> No
 
 
 def _export_visual_role(args: argparse.Namespace, source: HFModelSource) -> None:
+    """Delegate the visual role to the existing Edge-LLM visual exporter."""
     from tensorrt_edgellm.onnx_export.visual_export import visual_export
 
     output_dir = _role_output_dir(args, "visual")
@@ -115,6 +135,7 @@ def _export_visual_role(args: argparse.Namespace, source: HFModelSource) -> None
 
 
 def _run_edge_export(args: argparse.Namespace, manifest_path: Path, roles: tuple[str, ...]) -> None:
+    """Run the shared Edge exporter on a generated manifest."""
     exporter = EdgeExport.from_manifest_path(manifest_path)
     exporter.run(
         EdgeExportOptions(
@@ -131,6 +152,13 @@ def _run_edge_export(args: argparse.Namespace, manifest_path: Path, roles: tuple
 
 
 def main() -> None:
+    """Parse CLI flags and run direct-HF Edge export.
+
+    This command owns the "from Hugging Face" convenience path. It
+    normalizes CLI options into ``HFModelSource``, selects a coarse
+    strategy family, and then either delegates to current component
+    exporters or runs ``EdgeExport`` through a generated manifest.
+    """
     parser = argparse.ArgumentParser(
         description="Export Edge-LLM roles directly from a Hugging Face model path/id."
     )
@@ -189,6 +217,8 @@ def main() -> None:
         if unknown_roles:
             raise ValueError(f"Unsupported role(s): {', '.join(sorted(unknown_roles))}")
 
+        # Normalize all HF/model-loading options into one reusable
+        # object before choosing a family strategy.
         source = HFModelSource.from_args(args, model_attr="model")
         family = source.detected_family()
         print(f"[export_from_hf] Family = {family}")
@@ -209,6 +239,8 @@ def main() -> None:
         if "action" in roles:
             action_cfg = replace(cfg, roles=("action",))
             strategy = _build_strategy(family, action_cfg)
+            # Strategy output is a normal eager manifest, which keeps
+            # direct-HF and user-authored eager export on the same path.
             manifest = strategy.build_manifest()
             action_manifest_path = _default_manifest_path(args)
             action_manifest_path.parent.mkdir(parents=True, exist_ok=True)

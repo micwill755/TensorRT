@@ -65,6 +65,7 @@ class VisionInputContract:
     )
 
     def as_component_contract(self) -> ComponentContract:
+        """Convert the vision-specific contract to the common schema."""
         return ComponentContract(
             component=COMPONENT_VISUAL,
             name=self.name,
@@ -78,6 +79,7 @@ class VisionInputContract:
         )
 
     def to_manifest_dict(self) -> Dict[str, Any]:
+        """Serialize this vision contract for JSON output."""
         data = self.as_component_contract().to_manifest_dict()
         data["requires_processor_sample"] = self.requires_processor_sample
         return data
@@ -128,7 +130,11 @@ def write_vision_contract_manifest(
     artifacts: Optional[Mapping[str, Any]] = None,
     filename: str = VISION_CONTRACT_MANIFEST_FILENAME,
 ) -> Path:
-    """Write visual contract metadata beside an exported visual artifact."""
+    """Write visual contract metadata beside an exported visual artifact.
+
+    This records image/preprocessor input semantics and visual
+    embedding outputs so generic visual runners can bind the engine.
+    """
     contract = get_vision_input_contract(contract_name)
     return write_component_contract_manifest(
         output_dir,
@@ -146,6 +152,7 @@ def write_vision_contract_manifest(
 
 
 def _register_builtin_contracts() -> None:
+    """Install built-in visual input contract families."""
     register_vision_input_contract(
         VisionInputContract(
             name=VIT_INPUT_CONTRACT_NATIVE,

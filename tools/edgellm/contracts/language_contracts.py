@@ -36,7 +36,11 @@ LANGUAGE_CONTRACT_OMNI_CODE_PREDICTOR = "omni_code_predictor"
 
 @dataclass(frozen=True)
 class LanguageRuntimeContract:
-    """Stable tensor contract family for a language engine export."""
+    """Stable tensor contract family for a language engine export.
+
+    Language contracts describe decoder I/O such as embeddings, KV
+    cache tensors, rope tables, context lengths, and logits.
+    """
 
     name: str
     input_names: Tuple[str, ...]
@@ -46,6 +50,7 @@ class LanguageRuntimeContract:
     runtime_contract: str = "edgellm"
 
     def as_component_contract(self) -> ComponentContract:
+        """Convert the language-specific contract to the common schema."""
         return ComponentContract(
             component=COMPONENT_LANGUAGE,
             name=self.name,
@@ -57,6 +62,7 @@ class LanguageRuntimeContract:
         )
 
     def to_manifest_dict(self) -> Dict[str, Any]:
+        """Serialize this language contract for JSON output."""
         return self.as_component_contract().to_manifest_dict()
 
 
@@ -104,7 +110,12 @@ def write_language_contract_manifest(
     artifacts: Optional[Mapping[str, Any]] = None,
     filename: str = LANGUAGE_CONTRACT_MANIFEST_FILENAME,
 ) -> Path:
-    """Write language contract metadata beside an exported language artifact."""
+    """Write language contract metadata beside an exported language artifact.
+
+    The output file lets runtime code bind the compiled decoder
+    engine without rediscovering the graph structure from the engine
+    alone.
+    """
     contract = get_language_runtime_contract(contract_name)
     return write_component_contract_manifest(
         output_dir,
@@ -121,6 +132,7 @@ def write_language_contract_manifest(
 
 
 def _register_builtin_contracts() -> None:
+    """Install built-in language decoder contract families."""
     register_language_runtime_contract(
         LanguageRuntimeContract(
             name=LANGUAGE_CONTRACT_DECODER_KV_CACHE,

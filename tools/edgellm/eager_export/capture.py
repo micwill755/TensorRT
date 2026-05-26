@@ -25,7 +25,12 @@ _EXAMPLE_SPEC_KEYS = {
 
 @dataclass
 class ExampleInputs:
-    """Normalized example inputs for one eager role."""
+    """Normalized example inputs for one eager role.
+
+    Torch export and Torch-TensorRT need concrete example tensors to
+    trace shapes and dtypes. Hooks can return examples in several
+    convenient forms; the exporter converts them into this object.
+    """
 
     args: tuple[Any, ...] = ()
     kwargs: dict[str, Any] = field(default_factory=dict)
@@ -36,6 +41,7 @@ class ExampleInputs:
 
 
 def _normalize_axes(value: Any) -> dict[str, dict[int, str]]:
+    """Convert optional dynamic-axis metadata to a stable shape."""
     if not value:
         return {}
     return {
@@ -48,7 +54,13 @@ def _normalize_axes(value: Any) -> dict[str, dict[int, str]]:
 
 
 def normalize_example_inputs(value: Any) -> ExampleInputs:
-    """Normalize hook output into args/kwargs plus optional export metadata."""
+    """Normalize hook output into args/kwargs and export metadata.
+
+    A hook may return a dict with explicit ``args`` and ``kwargs``, a
+    bare tuple/list of positional inputs, a dict of keyword inputs,
+    or a single tensor. This function makes those cases look the same
+    to the capture/compile code.
+    """
     if isinstance(value, ExampleInputs):
         return value
 
@@ -85,6 +97,12 @@ def normalize_example_inputs(value: Any) -> ExampleInputs:
 
 
 def _infer_forward_input_names(module: Any, count: int) -> list[str]:
+    """Guess positional input names from ``module.forward``.
+
+    This is a fallback only. Explicit names from the manifest or
+    example hook are preferred because runtime contracts depend on
+    stable tensor names.
+    """
     try:
         params = list(signature(module.forward).parameters)
     except (AttributeError, TypeError, ValueError):
@@ -115,6 +133,13 @@ def call_example_input_hook(
     dtype: Optional[str] = None,
     hook_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> Any:
+    """Import and call an example-input hook for one role.
+
+    The hook receives the manifest, role, resolved module, loaded
+    model/tokenizer/processor, and device/dtype hints. Hooks can
+    ignore arguments they do not need because calls are signature
+    filtered.
+    """
     hook = import_object(hook_path)
     return call_with_supported_kwargs(
         hook,
@@ -140,7 +165,12 @@ def resolve_role_examples(
     device: Optional[str] = None,
     dtype: Optional[str] = None,
 ) -> ExampleInputs:
-    """Resolve examples from role-specific hook or top-level hook."""
+    """Resolve example inputs for a role.
+
+    Role-specific hooks win because different components often need
+    different tensor structures. A top-level hook is useful for small
+    smoke manifests where one hook returns examples for all roles.
+    """
     if role.example_inputs:
         raw = call_example_input_hook(
             role.example_inputs,
@@ -180,7 +210,13 @@ def capture_exported_program(
     *,
     strict: bool = False,
 ) -> Any:
-    """Capture a role with torch.export and return the ExportedProgram."""
+    """Capture a role with ``torch.export`` and return the program.
+
+    The normal public API is tried first. If export fails because of
+    dynamic-shape guard strictness, the fallback asks Torch to prefer
+    deferred runtime assertions, which is friendlier for model export
+    experiments.
+    """
     import torch
 
     if hasattr(module, "eval"):
@@ -208,14 +244,14 @@ def capture_exported_program(
 
 
 def load_exported_program(path: str | Path) -> Any:
-    """Load a torch.export ExportedProgram from disk."""
+    """Load a ``torch.export`` ExportedProgram from disk."""
     import torch
 
     return torch.export.load(Path(path).expanduser().resolve())
 
 
 def save_exported_program(exported_program: Any, output_path: str | Path) -> Path:
-    """Save an ExportedProgram to disk."""
+    """Save an ExportedProgram to disk, creating the directory first."""
     import torch
 
     path = Path(output_path).expanduser().resolve()

@@ -15,7 +15,13 @@ from .manifest import EagerExportManifest
 
 @dataclass
 class LoadedEagerModel:
-    """Normalized result from a user-provided eager model loader."""
+    """Normalized result from a user-provided eager model loader.
+
+    Loader hooks are allowed to return several shapes: a model, a
+    tuple, or a mapping. The exporter converts all of them into this
+    single object so later stages do not need to care how loading was
+    implemented.
+    """
 
     model: Any
     tokenizer: Any = None
@@ -24,7 +30,13 @@ class LoadedEagerModel:
 
 
 def import_object(path: str) -> Any:
-    """Import an object by 'package.module:object' or dotted path."""
+    """Import a Python object from a string path.
+
+    Manifests name hooks as strings so they can live outside this
+    package. Both ``package.module:object`` and
+    ``package.module.object`` forms are accepted. Nested attributes
+    after the object name are resolved one by one.
+    """
     if not path or not path.strip():
         raise ValueError("Expected a fully-qualified import path")
     normalized = path.strip()
@@ -42,7 +54,13 @@ def import_object(path: str) -> Any:
 
 
 def call_with_supported_kwargs(fn: Callable[..., Any], **kwargs: Any) -> Any:
-    """Call a user hook, passing only kwargs accepted by its signature."""
+    """Call a user hook while tolerating optional exporter arguments.
+
+    Hooks can opt into only the parameters they need. If the hook
+    accepts ``**kwargs`` we pass everything; otherwise we inspect the
+    signature and drop unsupported names. This keeps old hooks working
+    as the exporter grows new context arguments.
+    """
     try:
         params = signature(fn).parameters
     except (TypeError, ValueError):
@@ -60,7 +78,15 @@ def call_with_supported_kwargs(fn: Callable[..., Any], **kwargs: Any) -> Any:
 
 
 def normalize_loaded_model(value: Any) -> LoadedEagerModel:
-    """Normalize common loader return shapes into LoadedEagerModel."""
+    """Normalize common loader return shapes into ``LoadedEagerModel``.
+
+    Supported returns are:
+    - ``LoadedEagerModel``: already normalized.
+    - mapping with ``model`` or ``root_model``: extra keys become
+      ``extra`` metadata.
+    - tuple: interpreted as ``(model, tokenizer, processor, ...)``.
+    - anything else: treated as the model itself.
+    """
     if isinstance(value, LoadedEagerModel):
         return value
 
@@ -103,7 +129,11 @@ def load_eager_model(
     device: Optional[str] = None,
     dtype: Optional[str] = None,
 ) -> LoadedEagerModel:
-    """Call the manifest loader and normalize its result."""
+    """Call the manifest loader and normalize its result.
+
+    If no loader is configured, the manifest must refer to an
+    already-saved ExportedProgram instead of a live Python module.
+    """
     if not manifest.loader:
         return LoadedEagerModel(model=None)
     loader = import_object(manifest.loader)

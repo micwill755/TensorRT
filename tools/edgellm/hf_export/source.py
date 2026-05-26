@@ -40,6 +40,12 @@ HF_STRATEGY_FAMILIES = (
 
 
 def _getattr_any(obj: Any, *names: str, default: Any = None) -> Any:
+    """Return the first non-empty attribute from ``obj``.
+
+    This lets one source object be built from several CLIs whose
+    flags may use slightly different names, for example ``model``
+    versus ``model_dir``.
+    """
     for name in names:
         value = getattr(obj, name, default)
         if value not in (None, ""):
@@ -48,6 +54,11 @@ def _getattr_any(obj: Any, *names: str, default: Any = None) -> Any:
 
 
 def _tuple_from_arg(value: Any) -> tuple[str, ...]:
+    """Normalize comma-separated or repeated CLI role values.
+
+    Argparse can produce ``None``, a string, or a sequence depending
+    on how a flag is declared. Strategies only need a tuple.
+    """
     if value in (None, ""):
         return ()
     if isinstance(value, str):
@@ -152,6 +163,12 @@ class HFModelSource:
 
     @classmethod
     def from_args(cls, args: Any, *, model_attr: str = "model") -> "HFModelSource":
+        """Build a source description from an argparse namespace.
+
+        This is the boundary between command-line flags and the
+        reusable HF/export schema. After this point, code should pass
+        ``HFModelSource`` around instead of reading argparse fields.
+        """
         model = _getattr_any(args, model_attr, "model", "model_dir")
         if not model:
             raise ValueError(f"Could not build HFModelSource: missing {model_attr!r}")
@@ -224,11 +241,13 @@ class HFModelSource:
         )
 
     def detected_family(self) -> str:
+        """Return the requested family or run lightweight detection."""
         if self.family and self.family != "auto":
             return self.family
         return detect_family(self.model, task_override=self.task)
 
     def normalized_dtype(self) -> Optional[str]:
+        """Map run_hf-style precision names to Edge exporter dtype names."""
         if self.dtype:
             return self.dtype
         if self.precision == "FP16":
@@ -240,7 +259,12 @@ class HFModelSource:
         return None
 
     def run_config_kwargs(self) -> dict[str, Any]:
-        """Return Naren tools/hf RunConfig-compatible fields."""
+        """Return fields compatible with run_hf-style ``RunConfig``.
+
+        Not every field is consumed by the Edge path today. Keeping
+        them together makes it easier to converge this tool with the
+        broader Torch-TensorRT HF strategy runner later.
+        """
         return {
             "model": self.model,
             "task": self.task,
@@ -274,6 +298,7 @@ class HFModelSource:
         }
 
     def language_kwargs(self) -> dict[str, Any]:
+        """Return only the fields expected by the LLM exporter."""
         return {
             "model_dir": self.model,
             "model_class": self.model_class,
@@ -285,6 +310,7 @@ class HFModelSource:
         }
 
     def visual_kwargs(self) -> dict[str, Any]:
+        """Return only the fields expected by the visual exporter."""
         return {
             "model_dir": self.model,
             "model_class": self.model_class,
@@ -297,6 +323,7 @@ class HFModelSource:
         }
 
     def action_kwargs(self) -> dict[str, Any]:
+        """Return only the fields expected by action-role exporters."""
         return {
             "model_dir": self.model,
             "model_class": self.model_class,
@@ -304,6 +331,7 @@ class HFModelSource:
         }
 
     def vla_loader_kwargs(self) -> dict[str, Any]:
+        """Return model-loading fields for the VLA eager loader hook."""
         return {
             "model_dir": self.model,
             "model_class": self.model_class,
@@ -312,6 +340,12 @@ class HFModelSource:
         }
 
     def to_manifest_metadata(self) -> dict[str, Any]:
+        """Serialize source information into manifest metadata.
+
+        This makes generated manifests explain where they came from
+        and which knobs were used, which is useful after engines have
+        been copied away from the original export command.
+        """
         data = asdict(self)
         data.pop("metadata", None)
         data.pop("extra_options", None)

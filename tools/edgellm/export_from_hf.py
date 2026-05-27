@@ -20,23 +20,19 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.edgellm.edge_export import EdgeExport, EdgeExportOptions
-from tools.edgellm.hf_export.source import HFModelSource
+from tools.edgellm.hf_export.source import HFModelSource, HF_STRATEGY_FAMILIES
 from tools.edgellm.hf_export.strategies.base import HFExportConfig
 from tools.edgellm.hf_export.strategies.vla import VLAEdgeStrategy
 
 
 def _split_roles(values: Optional[list[str]]) -> tuple[str, ...]:
-    """Normalize repeated/comma-separated ``--role`` flags.
-
-    Direct HF export defaults to the action role because that is the
-    first role implemented through the strategy-to-manifest path.
-    """
+    """Normalize repeated/comma-separated ``--role`` flags."""
     if not values:
-        return ("action",)
+        return ()
     roles: list[str] = []
     for value in values:
         roles.extend(item.strip() for item in value.split(",") if item.strip())
-    return tuple(roles or ("action",))
+    return tuple(roles)
 
 
 def _ordered_roles(roles: tuple[str, ...]) -> tuple[str, ...]:
@@ -51,6 +47,43 @@ def _ordered_roles(roles: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+EDGE_DEFAULT_ROLES_BY_FAMILY = {
+    "llm": ("language",),
+    "vlm": ("language", "visual"),
+    "vla": ("language", "visual", "action"),
+    "multimodal": ("visual",),
+}
+
+
+EDGE_UNSUPPORTED_FAMILY_MESSAGE = {
+    "audio": "audio models do not have an Edge audio runtime contract yet",
+    "detection": "detection models do not have an Edge detection runtime contract yet",
+    "diffusion": "diffusion pipelines do not map to current Edge LLM runtime roles",
+    "encoder": "encoder models need an explicit --role because only some vision encoders map to visual export",
+    "llm_tp": "tensor-parallel LLM is not an Edge role contract yet",
+    "seq2seq": "seq2seq models need a future encoder/decoder Edge contract",
+    "video_diffusion": "video diffusion pipelines do not have an Edge video runtime contract yet",
+}
+
+
+def _resolve_roles(args: argparse.Namespace, family: str) -> tuple[str, ...]:
+    """Resolve CLI roles or choose safe defaults from the detected family."""
+    explicit_roles = _split_roles(args.role)
+    if explicit_roles:
+        return _ordered_roles(explicit_roles)
+    default_roles = EDGE_DEFAULT_ROLES_BY_FAMILY.get(family)
+    if default_roles:
+        return _ordered_roles(default_roles)
+    reason = EDGE_UNSUPPORTED_FAMILY_MESSAGE.get(
+        family,
+        f"family {family!r} has no default Edge role mapping yet",
+    )
+    raise NotImplementedError(
+        f"Detected HF family {family!r}, but {reason}. "
+        "Pass --role plus explicit module hints if you want to force a specific Edge role."
+    )
+
+
 def _build_strategy(family: str, cfg: HFExportConfig):
     """Create the HF family strategy for roles that use manifests."""
     if family == "vla":
@@ -60,6 +93,53 @@ def _build_strategy(family: str, cfg: HFExportConfig):
         f"Family {family!r} was detected/requested. LLM/VLM families should use "
         "the existing component exporters until their role strategies are folded in."
     )
+
+
+def _infer_projector_module(source: HFModelSource, vision_module: Optional[str]) -> Optional[str]:
+    """Infer a projector path when the visual path has a known companion."""
+    if source.projector_module or not vision_module:
+        return None
+    model_name = source.model.lower()
+    if vision_module.endswith(".model.vision_tower"):
+        parent = vision_module[: -len(".model.vision_tower")]
+        return f"{parent}.multi_modal_projector"
+    if "pi05" in model_name or "paligemma" in vision_module.lower():
+        return "model.paligemma_with_expert.paligemma.multi_modal_projector"
+    return None
+
+
+def _apply_resolution_hints(source: HFModelSource, roles: tuple[str, ...]) -> HFModelSource:
+    """Fill missing component hints from the lightweight HF role resolver."""
+    if not roles:
+        return source
+    try:
+        from tools.edgellm.hf_export.resolution import resolve_hf_roles
+
+        plan = resolve_hf_roles(source, roles=roles)
+    except Exception as exc:
+        print(f"[export_from_hf] Could not apply role-resolution hints: {exc}")
+        return source
+
+    updates: dict[str, object] = {}
+    visual_candidate = plan.selected.get("visual")
+    if visual_candidate is not None and not source.vision_module:
+        updates["vision_module"] = visual_candidate.module_path
+        evidence = ", ".join(visual_candidate.evidence)
+        print(
+            "[export_from_hf] Inferred visual module "
+            f"{visual_candidate.module_path!r}"
+            + (f" ({evidence})" if evidence else "")
+        )
+
+    vision_module = str(updates.get("vision_module") or source.vision_module or "")
+    projector_module = _infer_projector_module(source, vision_module)
+    if projector_module:
+        updates["projector_module"] = projector_module
+        print(f"[export_from_hf] Inferred projector module {projector_module!r}")
+
+    if not updates:
+        return source
+    return replace(source, **updates)
 
 
 def _role_output_dir(args: argparse.Namespace, role: str) -> str:
@@ -167,7 +247,7 @@ def main() -> None:
     parser.add_argument(
         "--family",
         default="auto",
-        choices=["auto", "llm", "vlm", "vla"],
+        choices=["auto", *HF_STRATEGY_FAMILIES],
         help="Family override. Default: auto detect.",
     )
     parser.add_argument(
@@ -212,16 +292,17 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        roles = _ordered_roles(_split_roles(args.role))
-        unknown_roles = set(roles) - {"language", "visual", "action"}
-        if unknown_roles:
-            raise ValueError(f"Unsupported role(s): {', '.join(sorted(unknown_roles))}")
-
         # Normalize all HF/model-loading options into one reusable
         # object before choosing a family strategy.
         source = HFModelSource.from_args(args, model_attr="model")
         family = source.detected_family()
+        roles = _resolve_roles(args, family)
+        source = _apply_resolution_hints(source, roles)
+        unknown_roles = set(roles) - {"language", "visual", "action"}
+        if unknown_roles:
+            raise ValueError(f"Unsupported role(s): {', '.join(sorted(unknown_roles))}")
         print(f"[export_from_hf] Family = {family}")
+        print(f"[export_from_hf] Roles = {', '.join(roles)}")
         cfg = HFExportConfig(
             model=source.model,
             family=family,

@@ -71,6 +71,20 @@ def _tuple_from_arg(value: Any) -> tuple[str, ...]:
     return (str(value),)
 
 
+def _normalize_object_path(value: Any) -> Any:
+    """Normalize object import hints to dotted paths.
+
+    Some Torch/Python utilities accept ``module:Class`` while the legacy
+    Edge-LLM exporters expect ``module.Class``. Keep the CLI tolerant and
+    pass a single dotted form downstream.
+    """
+    if isinstance(value, str) and ":" in value:
+        module_name, object_name = value.split(":", 1)
+        if module_name and object_name:
+            return f"{module_name}.{object_name}"
+    return value
+
+
 @dataclass(frozen=True)
 class HFModelSource:
     """Reusable HF checkpoint plus run_hf-style strategy context.
@@ -178,7 +192,7 @@ class HFModelSource:
             task=_getattr_any(args, "task"),
             family=_getattr_any(args, "family"),
             roles=_tuple_from_arg(_getattr_any(args, "role", "roles")),
-            model_class=_getattr_any(args, "model_class"),
+            model_class=_normalize_object_path(_getattr_any(args, "model_class")),
             tokenizer=_getattr_any(args, "tokenizer"),
             processor_model=_getattr_any(args, "processor_model"),
             trust_remote_code=bool(getattr(args, "trust_remote_code", True)),

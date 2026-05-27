@@ -273,6 +273,8 @@ def load_vla_model(
     torch_dtype = _torch_dtype(dtype)
     tokenizer = None
     processor = None
+    for exporter_key in ("manifest", "manifest_path"):
+        from_pretrained_kwargs.pop(exporter_key, None)
 
     if model_class:
         model = _load_with_class(

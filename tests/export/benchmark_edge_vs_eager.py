@@ -25,11 +25,15 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+import numpy as np
 from typing import Any, Callable
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+from tests.export.vla_test_data import load_vla_test_sample
 
 
 _STAGE_TIMING_RE = re.compile(r"Stage timings - (?P<stage>[^:]+): (?P<ms>[0-9.]+) ms")
@@ -51,6 +55,226 @@ def _stats(times_ms: list[float]) -> dict[str, float | int | None]:
         "max_ms": max(times_ms),
         "std_ms": statistics.pstdev(times_ms) if len(times_ms) > 1 else 0.0,
     }
+
+
+def _metric_stats(values: list[float]) -> dict[str, float | int | None]:
+    """Unit-neutral stats for quality metrics such as meters and ADE."""
+    stats = _stats(values)
+    return {
+        "count": stats["count"],
+        "min": stats["min_ms"],
+        "avg": stats["avg_ms"],
+        "max": stats["max_ms"],
+        "std": stats["std_ms"],
+    }
+
+
+def _points_array(value: Any) -> np.ndarray | None:
+    """Convert nested JSON trajectory-like data to ``[T, D]`` points."""
+    if value is None:
+        return None
+    array = np.asarray(value, dtype=np.float32)
+    if array.size == 0:
+        return None
+    while array.ndim > 2 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim > 2:
+        array = array.reshape(-1, array.shape[-1])
+    if array.ndim == 1:
+        if array.shape[0] < 2:
+            return None
+        array = array.reshape(1, -1)
+    if array.ndim != 2 or array.shape[-1] < 2:
+        return None
+    return array[:, :2]
+
+
+def _candidate_arrays(value: Any) -> list[np.ndarray]:
+    """Convert trajectory-like JSON to candidate ``[T, 2]`` arrays."""
+    if value is None:
+        return []
+    try:
+        array = np.asarray(value, dtype=np.float32)
+    except Exception:
+        return []
+    if array.size == 0:
+        return []
+    while array.ndim > 2 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim == 1:
+        return [_points_array(array)] if array.shape[0] >= 2 else []
+    if array.ndim == 2:
+        points = _points_array(array)
+        return [points] if points is not None else []
+    if array.ndim == 3:
+        if array.shape[-1] >= 2:
+            return [candidate[:, :2] for candidate in array]
+        if array.shape[1] >= 2:
+            return [candidate[:2, :].T for candidate in array]
+    if array.ndim > 3 and array.shape[-1] >= 2:
+        reshaped = array.reshape(-1, array.shape[-2], array.shape[-1])
+        return [candidate[:, :2] for candidate in reshaped]
+    return []
+
+
+def _candidate_trajectories(value: Any) -> list[np.ndarray]:
+    """Extract candidate ``[T, 2]`` trajectories from benchmark JSON output."""
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        candidates: list[np.ndarray] = []
+        for key in ("output_trajectory", "trajectory", "pred_trajectory", "action_trajectory", "pred_xyz"):
+            candidates.extend(_candidate_arrays(value.get(key)))
+        for response in value.get("responses", []) or []:
+            candidates.extend(_candidate_trajectories(response))
+        for key in ("action_pred", "actions", "action", "output"):
+            child = value.get(key)
+            if isinstance(child, dict):
+                candidates.extend(_candidate_arrays(child.get("values") or child.get("data") or child.get("trajectory")))
+            else:
+                candidates.extend(_candidate_arrays(child))
+        return [candidate for candidate in candidates if candidate is not None]
+    if isinstance(value, list):
+        return _candidate_arrays(value)
+    return []
+
+
+def _compute_minade(pred_candidates: list[np.ndarray], gt_xy: np.ndarray) -> float | None:
+    """Alpamayo-style minADE: average displacement per candidate, then take min."""
+    if not pred_candidates or gt_xy is None or gt_xy.size == 0:
+        return None
+    ades: list[float] = []
+    for pred_xy in pred_candidates:
+        horizon = min(len(pred_xy), len(gt_xy))
+        if horizon <= 0:
+            continue
+        diff = np.linalg.norm(pred_xy[:horizon, :2] - gt_xy[:horizon, :2], axis=1).mean()
+        ades.append(float(diff))
+    return min(ades) if ades else None
+
+
+def _add_minade_metrics(summary: dict[str, Any], args: argparse.Namespace) -> None:
+    sample = load_vla_test_sample(args)
+    if sample is None or sample.ground_truth_trajectory is None:
+        return
+    gt_xy = sample.ground_truth_trajectory
+    sample.write_ground_truth_trajectory(getattr(args, "write_ground_truth_trajectory", None))
+    summary["ground_truth_trajectory"] = {
+        "num_points": int(gt_xy.shape[0]),
+        "dim": int(gt_xy.shape[1]),
+        "source": sample.source,
+        "metadata": sample.metadata,
+    }
+    for name in ("edge", "eager"):
+        result = summary.get(name)
+        if not result:
+            continue
+        minades: list[float] = []
+        for run in result.get("runs", []):
+            candidates = _candidate_trajectories(run.get("output"))
+            minade = _compute_minade(candidates, gt_xy)
+            if minade is None:
+                continue
+            run.setdefault("quality_metrics", {})["minade"] = minade
+            if run.get("phase") == "timed":
+                minades.append(minade)
+        if minades:
+            result.setdefault("quality_stats", {})["minade"] = _metric_stats(minades)
+
+
+def _first_candidate(output: Any) -> np.ndarray | None:
+    candidates = _candidate_trajectories(output)
+    return candidates[0] if candidates else None
+
+
+def _trajectory_diff(pred_a: np.ndarray, pred_b: np.ndarray) -> dict[str, float] | None:
+    """Alpamayo-style trajectory tensor diff for two candidate trajectories."""
+    horizon = min(len(pred_a), len(pred_b))
+    if horizon <= 0:
+        return None
+    a = pred_a[:horizon, :2]
+    b = pred_b[:horizon, :2]
+    abs_diff = np.abs(a - b)
+    l2 = np.linalg.norm(a - b, axis=1)
+    return {
+        "num_points": int(horizon),
+        "max_abs_m": float(abs_diff.max()),
+        "mean_abs_m": float(abs_diff.mean()),
+        "mean_l2_m": float(l2.mean()),
+    }
+
+
+def _timed_runs_by_order(result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not result:
+        return []
+    return [run for run in result.get("runs", []) if run.get("phase") == "timed"]
+
+
+def _add_edge_eager_comparison(summary: dict[str, Any], args: argparse.Namespace) -> None:
+    """Compare Edge and eager outputs in the same spirit as Alpamayo TRT tests."""
+    edge_runs = _timed_runs_by_order(summary.get("edge"))
+    eager_runs = _timed_runs_by_order(summary.get("eager"))
+    pair_count = min(len(edge_runs), len(eager_runs))
+    if pair_count == 0:
+        return
+
+    trajectory_diffs: list[dict[str, Any]] = []
+    ade_diffs: list[float] = []
+    for idx in range(pair_count):
+        edge_run = edge_runs[idx]
+        eager_run = eager_runs[idx]
+        pair: dict[str, Any] = {
+            "pair_index": idx,
+            "edge_iteration": edge_run.get("iteration"),
+            "eager_iteration": eager_run.get("iteration"),
+        }
+
+        edge_traj = _first_candidate(edge_run.get("output"))
+        eager_traj = _first_candidate(eager_run.get("output"))
+        diff = _trajectory_diff(edge_traj, eager_traj) if edge_traj is not None and eager_traj is not None else None
+        if diff is not None:
+            pair["trajectory_diff"] = diff
+
+        edge_minade = (edge_run.get("quality_metrics") or {}).get("minade")
+        eager_minade = (eager_run.get("quality_metrics") or {}).get("minade")
+        if edge_minade is not None and eager_minade is not None:
+            ade_diff = abs(float(edge_minade) - float(eager_minade))
+            pair["ade_diff_m"] = ade_diff
+            ade_diffs.append(ade_diff)
+
+        if "trajectory_diff" in pair or "ade_diff_m" in pair:
+            trajectory_diffs.append(pair)
+
+    if not trajectory_diffs:
+        return
+
+    mean_abs = [item["trajectory_diff"]["mean_abs_m"] for item in trajectory_diffs if "trajectory_diff" in item]
+    max_abs = [item["trajectory_diff"]["max_abs_m"] for item in trajectory_diffs if "trajectory_diff" in item]
+    mean_l2 = [item["trajectory_diff"]["mean_l2_m"] for item in trajectory_diffs if "trajectory_diff" in item]
+
+    comparison: dict[str, Any] = {
+        "timed_pair_count": pair_count,
+        "pairs": trajectory_diffs,
+        "thresholds": {
+            "trajectory_mean_abs_m": args.trajectory_diff_threshold,
+            "ade_diff_m": args.ade_diff_threshold,
+        },
+    }
+    if mean_abs:
+        comparison["trajectory_diff_stats"] = {
+            "mean_abs_m": _metric_stats(mean_abs),
+            "max_abs_m": _metric_stats(max_abs),
+            "mean_l2_m": _metric_stats(mean_l2),
+        }
+        comparison["trajectory_mean_abs_pass"] = statistics.fmean(mean_abs) <= args.trajectory_diff_threshold
+    if ade_diffs:
+        comparison["ade_diff_stats"] = _metric_stats(ade_diffs)
+        comparison["ade_diff_pass"] = statistics.fmean(ade_diffs) <= args.ade_diff_threshold
+
+    pass_values = [value for key, value in comparison.items() if key.endswith("_pass")]
+    if pass_values:
+        comparison["passed"] = all(pass_values)
+    summary["edge_vs_eager_comparison"] = comparison
 
 
 def _load_json(path: Path) -> Any | None:
@@ -118,11 +342,13 @@ def _run_command(
     stderr_path: Path,
 ) -> tuple[float, int, str, str]:
     start = time.perf_counter()
-    proc = subprocess.run(command, env=env, cwd=cwd, text=True, capture_output=True, check=False)
+    proc = subprocess.run(command, env=env, cwd=cwd, capture_output=True, check=False)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
-    _write_text(stdout_path, proc.stdout)
-    _write_text(stderr_path, proc.stderr)
-    return elapsed_ms, proc.returncode, proc.stdout, proc.stderr
+    stdout = proc.stdout.decode("utf-8", errors="replace")
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    _write_text(stdout_path, stdout)
+    _write_text(stderr_path, stderr)
+    return elapsed_ms, proc.returncode, stdout, stderr
 
 
 def _extract_stage_timings(log_text: str) -> dict[str, float]:
@@ -336,6 +562,25 @@ def _print_summary(summary: dict[str, Any]) -> None:
         stage_stats = result.get("stage_stats", {})
         if "e2e" in stage_stats and stage_stats["e2e"]["count"]:
             print(f"      runtime_e2e_avg={stage_stats['e2e']['avg_ms']:9.3f} ms")
+        quality_stats = result.get("quality_stats", {})
+        if "minade" in quality_stats and quality_stats["minade"]["count"]:
+            print(f"      minADE_avg={quality_stats['minade']['avg']:9.4f} m")
+    comparison = summary.get("edge_vs_eager_comparison", {})
+    if comparison:
+        print("\n=== Edge vs Eager Quality ===")
+        traj_stats = comparison.get("trajectory_diff_stats", {})
+        if traj_stats:
+            print(
+                "trajectory diff: "
+                f"mean_abs_avg={traj_stats['mean_abs_m']['avg']:9.4f} m  "
+                f"max_abs_avg={traj_stats['max_abs_m']['avg']:9.4f} m  "
+                f"mean_l2_avg={traj_stats['mean_l2_m']['avg']:9.4f} m"
+            )
+        ade_stats = comparison.get("ade_diff_stats")
+        if ade_stats and ade_stats["count"]:
+            print(f"ADE diff avg={ade_stats['avg']:9.4f} m")
+        if "passed" in comparison:
+            print(f"quality thresholds passed: {comparison['passed']}")
     speedup = summary.get("speedup_eager_over_edge")
     if speedup is not None:
         print(f"speedup eager/edge: {speedup:.3f}x")
@@ -355,6 +600,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=10, help="Timed iterations, excluding warmup.")
     parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations excluded from stats.")
     parser.add_argument("--seed", type=int, default=5)
+    parser.add_argument(
+        "--test_data_source",
+        default="auto",
+        choices=("auto", "json", "input_json", "alpamayo", "lerobot", "none", "off"),
+        help="Source used to resolve future ground truth for minADE.",
+    )
+    parser.add_argument("--ground_truth_trajectory", help="Optional JSON future trajectory used to compute minADE.")
+    parser.add_argument("--write_ground_truth_trajectory", help="Optional path to write the resolved ground-truth trajectory JSON.")
+    parser.add_argument("--alpamayo_clip_id", help="Load ground-truth future trajectory from Alpamayo's physical_ai_av dataset clip.")
+    parser.add_argument("--alpamayo_t0_us", type=int, default=5_100_000, help="Alpamayo sample timestamp in microseconds.")
+    parser.add_argument("--alpamayo_num_history_steps", type=int, default=16, help="Number of Alpamayo history trajectory points to load.")
+    parser.add_argument("--alpamayo_num_future_steps", type=int, default=64, help="Number of Alpamayo future trajectory points to load.")
+    parser.add_argument("--alpamayo_time_step", type=float, default=0.1, help="Alpamayo trajectory timestep in seconds.")
+    parser.add_argument("--alpamayo_num_frames", type=int, default=4, help="Number of Alpamayo camera frames per camera to load.")
+    parser.add_argument("--alpamayo_no_stream", action="store_true", help="Disable streaming when loading Alpamayo dataset features.")
+    parser.add_argument("--alpamayo_src", help="Optional path to Alpamayo src directory if not importable.")
+    parser.add_argument("--lerobot_dataset_repo_id", help="Optional LeRobot dataset repo id used to load future action ground truth.")
+    parser.add_argument("--lerobot_episode_index", type=int, default=0, help="LeRobot episode index used for future action ground truth.")
+    parser.add_argument("--lerobot_frame_index", type=int, default=0, help="Frame offset inside the LeRobot episode.")
+    parser.add_argument("--lerobot_future_steps", type=int, default=50, help="Number of LeRobot future action steps to load.")
+    parser.add_argument("--lerobot_action_key", default="action", help="LeRobot item key containing action vectors.")
+    parser.add_argument("--trajectory_diff_threshold", type=float, default=0.05, help="Pass threshold for Edge-vs-eager mean absolute trajectory diff in meters.")
+    parser.add_argument("--ade_diff_threshold", type=float, default=0.15, help="Pass threshold for Edge-vs-eager minADE difference in meters.")
+    parser.add_argument("--fail_on_quality_thresholds", action="store_true", help="Return nonzero if Edge-vs-eager quality thresholds fail.")
     parser.add_argument("--cwd", default=None, help="Optional working directory for child commands.")
     parser.add_argument("--keep_going", action="store_true", help="Continue after a failed child command.")
 
@@ -434,6 +703,9 @@ def main() -> int:
     elif not args.skip_eager and args.eager_adapter:
         summary["eager"] = _run_eager_adapter_series(args, args.output_dir / "eager")
 
+    _add_minade_metrics(summary, args)
+    _add_edge_eager_comparison(summary, args)
+
     edge_avg = summary.get("edge", {}).get("stats", {}).get("avg_ms")
     eager_avg = summary.get("eager", {}).get("stats", {}).get("avg_ms")
     if edge_avg and eager_avg:
@@ -443,6 +715,9 @@ def main() -> int:
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     _print_summary(summary)
     print(f"\nWrote benchmark report to {summary_path}")
+    comparison = summary.get("edge_vs_eager_comparison", {})
+    if args.fail_on_quality_thresholds and comparison.get("passed") is False:
+        return 1
     return 0
 
 

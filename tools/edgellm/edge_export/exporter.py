@@ -83,39 +83,69 @@ def _role_should_compile(role_compile: Optional[bool], global_compile: bool) -> 
     return bool(role_compile)
 
 
-def _compile_role_torchtrt(
+def _capture_role_for_torchtrt(
     module: Any,
     examples: Any,
     *,
-    output_dir: Path,
-    engine_path: Path,
     input_names: list[str],
-    output_names: list[str],
     dynamic_axes: Dict[str, Dict[int, str]],
-) -> None:
-    """Compile an eager ``nn.Module`` using the existing ONNX helper.
+    strict: bool,
+) -> tuple[Any, Any, Any]:
+    """Capture a live role and build matching Torch-TRT input specs.
 
-    This path is intentionally conservative: it supports positional
-    example inputs and delegates TensorRT plugin naming/profile work
-    to Edge-LLM's current ``export_onnx`` helper.
+    This keeps live modules on the same ``ExportedProgram`` path as roles that
+    arrive with a pre-captured ``.pt2`` file. Dynamic-shape/profile inference is
+    still delegated to the Edge-LLM Torch-TRT spec helper so the generated
+    engine keeps the runtime profile behavior used by the existing exporter.
     """
-    if examples.kwargs:
-        raise ValueError(
-            "Torch-TRT compile through the generic Edge exporter currently "
-            "requires positional example inputs. Use capture first, or provide "
-            "a role-specific packager/export hook for kwargs-heavy modules."
-        )
-    from tensorrt_edgellm.onnx_export.torch_trt_utils import export_onnx
-
-    export_onnx(
-        module,
-        list(examples.args),
-        str(output_dir),
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        engine_output_path=str(engine_path),
+    import torch
+    from tensorrt_edgellm.onnx_export.torch_trt_utils import (
+        _make_export_specs,
+        _replace_tensor_leaves,
     )
+
+    export_args = tuple(examples.args)
+    export_kwargs = dict(examples.kwargs or {})
+    inferred_dynamic_shapes, flat_trt_inputs = _make_export_specs(
+        module,
+        export_args,
+        export_kwargs,
+        input_names,
+        dynamic_axes=dynamic_axes,
+    )
+    dynamic_shapes = (
+        examples.dynamic_shapes
+        if examples.dynamic_shapes is not None
+        else inferred_dynamic_shapes
+    )
+
+    if hasattr(module, "eval"):
+        module.eval()
+    with torch.inference_mode():
+        try:
+            exported_program = torch.export.export(
+                module,
+                export_args,
+                kwargs=export_kwargs or None,
+                dynamic_shapes=dynamic_shapes,
+                strict=strict,
+            )
+        except Exception:
+            from torch.export._trace import _export
+
+            exported_program = _export(
+                module,
+                export_args,
+                kwargs=export_kwargs or None,
+                dynamic_shapes=dynamic_shapes,
+                strict=strict,
+                prefer_deferred_runtime_asserts_over_guards=True,
+            )
+
+    trt_input_iter = iter(flat_trt_inputs)
+    trt_arg_inputs = _replace_tensor_leaves(export_args, trt_input_iter)
+    trt_kwarg_inputs = _replace_tensor_leaves(export_kwargs, trt_input_iter)
+    return exported_program, trt_arg_inputs, trt_kwarg_inputs
 
 
 def _compile_exported_program_torchtrt(
@@ -125,6 +155,8 @@ def _compile_exported_program_torchtrt(
     engine_path: Path,
     input_names: list[str],
     output_names: list[str],
+    trt_arg_inputs: Any = None,
+    trt_kwarg_inputs: Any = None,
 ) -> None:
     """Compile a previously saved ``ExportedProgram`` to TensorRT.
 
@@ -140,18 +172,20 @@ def _compile_exported_program_torchtrt(
 
     import torch
     import torch_tensorrt
+    from torch_tensorrt.dynamo.conversion.edge_plugins import load_edge_plugin
     from tensorrt_edgellm.onnx_export.torch_trt_utils import (
         _make_trt_input_specs,
         _patch_torchtrt_network_names,
         _patch_torchtrt_output_names,
         _resolve_trt_device,
         _supported_compile_kwargs,
-        load_plugin,
     )
 
-    arg_name_hints = list(input_names[:len(examples.args)])
-    trt_arg_inputs = _make_trt_input_specs(examples.args, arg_name_hints)
-    trt_kwarg_inputs = _make_trt_input_specs(examples.kwargs)
+    if trt_arg_inputs is None:
+        arg_name_hints = list(input_names[:len(examples.args)])
+        trt_arg_inputs = _make_trt_input_specs(examples.args, arg_name_hints)
+    if trt_kwarg_inputs is None:
+        trt_kwarg_inputs = _make_trt_input_specs(examples.kwargs)
     convert_fn = torch_tensorrt.dynamo.convert_exported_program_to_serialized_trt_engine
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     compile_kwargs = _supported_compile_kwargs(convert_fn, {
@@ -168,7 +202,7 @@ def _compile_exported_program_torchtrt(
         "truncate_double": True,
     })
 
-    plugin_path = load_plugin()
+    plugin_path = load_edge_plugin()
     print(f"Saving TensorRT engine to {engine_path}")
     with _patch_torchtrt_output_names(list(output_names)), _patch_torchtrt_network_names():
         trt_engine = convert_fn(exported_program, **compile_kwargs)
@@ -291,16 +325,19 @@ class EdgeExport:
                 else None
             )
             exported_program_path: Optional[Path] = source_exported_program_path
+            captured_exported_program: Any = None
+            trt_arg_inputs: Any = None
+            trt_kwarg_inputs: Any = None
             if source_exported_program_path is not None:
                 print(f"Using existing {name} ExportedProgram: {source_exported_program_path}")
-            elif options.capture:
-                exported_program = capture_exported_program(
+            elif options.capture and not _role_should_compile(role.compile_torchtrt, options.compile_torchtrt):
+                captured_exported_program = capture_exported_program(
                     resolved.module,
                     examples,
                     strict=options.strict_export,
                 )
                 exported_program_path = save_exported_program(
-                    exported_program,
+                    captured_exported_program,
                     output_dir / f"{name}_exported_program.pt2",
                 )
                 print(f"Saved {name} ExportedProgram to {exported_program_path}")
@@ -309,24 +346,31 @@ class EdgeExport:
             if _role_should_compile(role.compile_torchtrt, options.compile_torchtrt):
                 engine_path = resolve_engine_path(output_dir, role)
                 if source_exported_program_path is not None:
-                    exported_program = load_exported_program(source_exported_program_path)
-                    _compile_exported_program_torchtrt(
-                        exported_program,
-                        examples,
-                        engine_path=engine_path,
-                        input_names=input_names,
-                        output_names=output_names,
-                    )
+                    captured_exported_program = load_exported_program(source_exported_program_path)
                 else:
-                    _compile_role_torchtrt(
+                    captured_exported_program, trt_arg_inputs, trt_kwarg_inputs = _capture_role_for_torchtrt(
                         resolved.module,
                         examples,
-                        output_dir=output_dir,
-                        engine_path=engine_path,
                         input_names=input_names,
-                        output_names=output_names,
                         dynamic_axes=dynamic_axes,
+                        strict=options.strict_export,
                     )
+
+                if options.capture and source_exported_program_path is None:
+                    exported_program_path = save_exported_program(
+                        captured_exported_program,
+                        output_dir / f"{name}_exported_program.pt2",
+                    )
+                    print(f"Saved {name} ExportedProgram to {exported_program_path}")
+                _compile_exported_program_torchtrt(
+                    captured_exported_program,
+                    examples,
+                    engine_path=engine_path,
+                    input_names=input_names,
+                    output_names=output_names,
+                    trt_arg_inputs=trt_arg_inputs,
+                    trt_kwarg_inputs=trt_kwarg_inputs,
+                )
 
             # Contracts are the semantic ABI consumed by generic Edge
             # runners; they explain what engine tensors mean.

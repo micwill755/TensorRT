@@ -180,34 +180,6 @@ def compile_vision_trt(
     return trt_vision
 
 
-def compile_diffusion_no_cache_trt(
-    model: nn.Module,
-    max_prefix_len: int,
-    batch_size: int = 1,
-    offload_module_to_cpu: bool = False,
-) -> nn.Module | None:
-    logger.info("\n" + "=" * 60)
-    logger.info("Compiling No-Cache Diffusion Step with TensorRT")
-    logger.info("=" * 60)
-
-    from utils.diffusion import compile_diffusion_step_no_cache
-
-    compile_diffusion_step_no_cache(
-        model,
-        max_prefix_len=max_prefix_len,
-        batch_size=int(batch_size),
-        device="cuda",
-        offload_module_to_cpu=offload_module_to_cpu,
-        debug=False,
-        accuracy_check=True,
-    )
-    if not hasattr(model, "_trt_diffusion_step_no_cache"):
-        logger.error("No-cache diffusion TRT compilation failed")
-        return None
-
-    logger.info("✓ No-cache diffusion step compiled with TRT")
-    return model._trt_diffusion_step_no_cache
-
 
 def compile_language_trt(
     model: nn.Module,
@@ -216,27 +188,8 @@ def compile_language_trt(
     batch_size: int = 1,
     offload_module_to_cpu: bool = False,
 ) -> nn.Module | None:
-    logger.info("\n" + "=" * 60)
-    logger.info("Compiling Language Model with TensorRT")
-    logger.info("=" * 60)
-
-    from utils.lm_with_cache import compile_vlm_lm_trt_with_cache
-
-    compiled_model = compile_vlm_lm_trt_with_cache(
-        model,
-        max_seq_len=max_seq_len,
-        max_prefix_len=max_seq_len if max_prefix_len is None else max_prefix_len,
-        batch_size=batch_size,
-        device="cuda",
-        offload_module_to_cpu=offload_module_to_cpu,
-        debug=False,
-        accuracy_check=True,
-    )
-    model._trt_vlm_backbone = compiled_model
-    model._trt_lm_max_batch_size = int(batch_size)
-    model._trt_lm_batch_size = int(batch_size)
-    logger.info("✓ Language model compiled with TRT")
-    return model._trt_vlm_backbone
+    logger.info("Skipping old tools/llm cache-based language TRT compile path")
+    return None
 
 
 def measure_prefix_seq_len_for_trt(
@@ -347,19 +300,7 @@ def compile_trt_modules(
 
 
     trt_diffusion = None
-    diffusion_max_prefix_len = max(int(prefix_seq_len), int(lm_seq_len))
-    logger.info(f"  diffusion max_prefix_len = {diffusion_max_prefix_len}")
-    trt_diffusion = compile_diffusion_no_cache_trt(
-        model,
-        max_prefix_len=diffusion_max_prefix_len,
-        batch_size=compile_batch,
-        offload_module_to_cpu=offload_module_to_cpu,
-    )
-    if trt_diffusion is None:
-        logger.error("Failed to compile no-cache diffusion step")
-    else:
-        model._trt_diffusion_batch_size = int(compile_batch)
-
+    logger.info("Skipping old tools/llm diffusion TRT compile path; using PyTorch diffusion fallback")
 
     return trt_vision, trt_lm, trt_diffusion, prefix_seq_len
 
@@ -382,7 +323,6 @@ def run_inference_trt(
         replace_padding_after_eos,
         to_special_token,
     )
-    from utils.prefix_cache import PrefixKVCache, stack_prefix_kv_from_cache
 
     torch.cuda.manual_seed_all(seed)
     model_inputs = create_inputs_fn()
@@ -488,28 +428,11 @@ def run_inference_trt(
         for i in range(b_star):
             attention_mask[i, :, :, offset[i] : -n_diffusion_tokens] = neg_inf
 
-        prefix_k, prefix_v = stack_prefix_kv_from_cache(
-            prompt_cache,
-            device=torch.device(device),
-            dtype=dtype,
-        )
-        # Defensive cast to guarantee TRT KV input dtypes stay aligned.
-        prefix_k = prefix_k.to(device=device, dtype=dtype).contiguous()
-        prefix_v = prefix_v.to(device=device, dtype=dtype).contiguous()
-        prompt_cache = PrefixKVCache(prefix_k, prefix_v)
         if trt_diffusion is not None:
-            logger.info(f"  prefix_k shape: {prefix_k.shape}")
-            if prefix_k.dtype != dtype or prefix_v.dtype != dtype:
-                raise TypeError(
-                    f"TRT KV dtype mismatch: expected {dtype}, got "
-                    f"prefix_k={prefix_k.dtype}, prefix_v={prefix_v.dtype}"
-                )
-            compiled_diff_batch = getattr(model, "_trt_diffusion_batch_size", None)
-            if compiled_diff_batch is not None and int(b_star) != int(compiled_diff_batch):
-                raise ValueError(
-                    f"TRT diffusion batch mismatch: compiled batch={compiled_diff_batch}, runtime batch={b_star}. "
-                    "Recompile TRT diffusion with matching batch (input_batch * num_traj_samples)."
-                )
+            raise RuntimeError(
+                "The old tools/llm TRT diffusion path was removed; use the tools/edgellm "
+                "EdgeExport action engine path instead."
+            )
 
         forward_kwargs = {}
         if model.config.expert_non_causal_attention:
@@ -586,10 +509,10 @@ def compile_trt_with_plugin(
     debug: bool = False,
     accuracy_check: bool = True,
 ) -> tuple[nn.Module | None, nn.Module | None, nn.Module | None, dict]:
-    """Compile (Vision, Plugin LM, Diffusion) TRT engines for plugin-based inference.
+    """Compile Vision and Plugin LM TRT engines for plugin-based inference.
 
-    Mirrors :func:`compile_trt_modules` but swaps ``compile_vlm_lm_trt_with_cache``
-    for :func:`compile_vlm_lm_trt_with_plugin` (TRT-LLM ``xqa_attn`` plugin).
+    Mirrors :func:`compile_trt_modules` but uses :func:`compile_vlm_lm_trt_with_plugin`
+    for the TRT-LLM ``xqa_attn`` plugin.
 
     Returns ``(trt_vision, trt_lm, trt_diffusion, plugin_info)`` where
     ``plugin_info`` carries metadata the plugin decode loop needs:
@@ -601,14 +524,13 @@ def compile_trt_with_plugin(
         - ``num_ds_layers`` : number of deepstack layers
         - ``rope_deltas_ref``: reference RoPE delta tensor (copied to CUDA)
     """
-    from utils.diffusion import compile_diffusion_fp16
     from utils.plugin.lm_plugin import compile_vlm_lm_trt_with_plugin
     from utils.vision import compile_vision_fp16
 
     torch.cuda.manual_seed_all(seed)
 
     logger.info("\n" + "=" * 60)
-    logger.info("Compiling Plugin TRT pipeline (Vision + Plugin LM + Diffusion)")
+    logger.info("Compiling Plugin TRT pipeline (Vision + Plugin LM, PyTorch diffusion fallback)")
     logger.info("=" * 60)
 
     model_inputs = create_inputs_fn()
@@ -652,19 +574,8 @@ def compile_trt_with_plugin(
     if trt_lm is None:
         logger.error("Plugin LM TRT compilation failed")
 
-    logger.info("\n" + "=" * 60)
-    logger.info("Compiling Diffusion Step (FP16 plugin pipeline)")
-    logger.info("=" * 60)
-    trt_diffusion = compile_diffusion_fp16(
-        model,
-        min_prefix_len=S_input,
-        max_prefix_len=S_input + max_generation_length + 10,
-        batch_size=batch_size,
-    )
-    if trt_diffusion is not None:
-        model._trt_diffusion_batch_size = int(batch_size)
-    else:
-        logger.error("Diffusion TRT compilation failed")
+    trt_diffusion = None
+    logger.info("Skipping old tools/llm diffusion TRT compile path; using PyTorch diffusion fallback")
 
     plugin_info = {
         "embed_tokens": _embed_tokens,
@@ -696,7 +607,7 @@ def run_inference_trt_plugin(
     top_p: float = 0.98,
     temperature: float = 0.6,
 ) -> tuple[torch.Tensor, torch.Tensor, dict, float]:
-    """Run inference with the plugin TRT pipeline (Vision+Plugin LM+Diffusion).
+    """Run inference with the plugin TRT pipeline (Vision+Plugin LM with PyTorch diffusion fallback).
 
     Mirrors :func:`run_inference_trt` but drives decode via a manual token
     loop that feeds the TRT-LLM ``xqa_attn`` plugin's in-place KV cache.
@@ -826,31 +737,10 @@ def run_inference_trt_plugin(
                 x.to(dtype), t.to(dtype), prefix_k, prefix_v, position_ids, attention_mask,
             )
     else:
-        from utils.prefix_cache import PrefixKVCache
-        prompt_cache = PrefixKVCache(prefix_k, prefix_v)
-        prefill_seq_len = prompt_cache.get_seq_length()
-        forward_kwargs = {}
-        if model.config.expert_non_causal_attention:
-            forward_kwargs["is_causal"] = False
-
-        def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            bsz = x.shape[0]
-            future_token_embeds = model.action_in_proj(x, t)
-            if future_token_embeds.dim() == 2:
-                future_token_embeds = future_token_embeds.view(bsz, n_diffusion_tokens, -1)
-            expert_out = model.expert(
-                inputs_embeds=future_token_embeds,
-                position_ids=position_ids,
-                past_key_values=prompt_cache,
-                attention_mask=attention_mask,
-                use_cache=True,
-                **forward_kwargs,
-            )
-            prompt_cache.crop(prefill_seq_len)
-            last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
-            return model.action_out_proj(last_hidden).view(
-                -1, *model.action_space.get_action_space_dims()
-            )
+        raise RuntimeError(
+            "The old tools/llm plugin LM path requires prefix_cache.py, which was removed; "
+            "use the tools/edgellm EdgeExport runtime path instead."
+        )
 
     sampled_action = model.diffusion.sample(
         batch_size=total_bsz,

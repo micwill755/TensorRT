@@ -20,6 +20,7 @@ from .remove_detach import remove_detach
 from .remove_input_alias_fixing_clones import remove_input_alias_fixing_clones
 from .remove_num_users_is_0_nodes import remove_num_users_is_0_nodes
 from .repair_input_as_output import repair_input_as_output
+from .replace_edge_attention_plugins import replace_edge_attention_plugins
 from .replace_fused_rms_norm import replace_fused_rms_norm
 from .replace_max_pool_with_indices import replace_max_pool_with_indices
 from .rule_based_autocast import rule_based_autocast
@@ -40,6 +41,7 @@ post_lowering_pass_list = [
     remove_assert_nodes,
     remove_num_users_is_0_nodes,
     complex_graph_detection,
+    replace_edge_attention_plugins,
     force_causal_efficient_attention,
 ]
 

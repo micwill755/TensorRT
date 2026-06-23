@@ -65,7 +65,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from utils import generate, record_stats, time_generate
+from utils.utils import generate, record_stats, time_generate
 
 logging.basicConfig(
     level=logging.INFO,

@@ -61,6 +61,7 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 TRT_INTERPRETER_CALL_PRE_OBSERVER: Observer[Callable[[torch.fx.GraphModule], None]] = (
     Observer("TRT_INTERPRETER_CALL_PRE_OBSERVER")
 )
+OUTPUT_NAMES_OVERRIDE: Optional[List[str]] = None
 
 
 class UnsupportedOperatorException(RuntimeError):
@@ -104,6 +105,8 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
         self.ctx = ConversionContext(
             self.builder.create_network(flag), compilation_settings
         )
+        if not hasattr(self.ctx, "requires_native_multidevice"):
+            self.ctx.requires_native_multidevice = False
 
         self.compilation_settings = compilation_settings
         # Always update the global converter registry with the current compilation
@@ -121,7 +124,10 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             )
 
         self.optimization_profiles: Optional[List[trt.IOptimizationProfile]] = (
-            [self.builder.create_optimization_profile()]
+            [
+                self.builder.create_optimization_profile(),
+                self.builder.create_optimization_profile(),
+            ]
             if any(
                 input_spec.shape_mode == Input._ShapeMode.DYNAMIC
                 for input_spec in input_specs
@@ -698,8 +704,9 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
         return trt_node
 
     def placeholder(self, target: str, args: Any, kwargs: Any) -> trt.ITensor:
-        self._input_names.append(target)
         current_input = self.input_specs[self.input_specs_iter]
+        binding_name = current_input.name if current_input.name is not None else target
+        self._input_names.append(binding_name)
         self.input_specs_iter += 1
         # Set optimization profile for dynamic input shape
         shape = None
@@ -715,14 +722,16 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             if current_input.is_shape_tensor:
                 # For shape_tensors, min/opt/max_shapes correspond to actual values
                 # of the shapes provided during runtime
-                self.optimization_profiles[0].set_shape_input(
-                    target, min_shape, opt_shape, max_shape
-                )
+                for optimization_profile in self.optimization_profiles:
+                    optimization_profile.set_shape_input(
+                        binding_name, min_shape, opt_shape, max_shape
+                    )
                 shape.append(len(opt_shape))
             else:
-                self.optimization_profiles[0].set_shape(
-                    target, min_shape, opt_shape, max_shape
-                )
+                for optimization_profile in self.optimization_profiles:
+                    optimization_profile.set_shape(
+                        binding_name, min_shape, opt_shape, max_shape
+                    )
 
                 for i in range(len(min_shape)):
                     if min_shape[i] == opt_shape[i] == max_shape[i]:
@@ -738,16 +747,16 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             shape = list(current_input.shape)
         else:
             raise RuntimeError(
-                f"Unable to access shape spec for input: {target} (got: {current_input})"
+                f"Unable to access shape spec for input: {binding_name} (got: {current_input})"
             )
 
         trt_input_dtype = current_input.dtype.to(trt.DataType, use_default=True)
         _LOGGER.debug(
-            f"Adding input to in-progress INetwork: {target} [shape={shape}, dtype={trt_input_dtype}]"
+            f"Adding input to in-progress INetwork: {binding_name} [shape={shape}, dtype={trt_input_dtype}]"
         )
 
         return self.ctx.net.add_input(
-            name=target,
+            name=binding_name,
             shape=tuple(shape),
             dtype=trt_input_dtype,
         )
@@ -861,6 +870,7 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             )
 
         marked_outputs_ids = []
+        marked_output_idx = 0
         for i, output in enumerate(outputs):
             # In some cases, the same output tensor may be marked multiple times, such as _to_copy,
             # so we skip marking if the output is already marked
@@ -868,7 +878,14 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
                 continue
             marked_outputs_ids.append(id(output))
 
-            name = f"output{i}"
+            if (
+                OUTPUT_NAMES_OVERRIDE is not None
+                and marked_output_idx < len(OUTPUT_NAMES_OVERRIDE)
+            ):
+                name = OUTPUT_NAMES_OVERRIDE[marked_output_idx]
+            else:
+                name = f"output{i}"
+            marked_output_idx += 1
 
             if self.output_dtypes is not None:
                 output_dtype = self.output_dtypes[i]
